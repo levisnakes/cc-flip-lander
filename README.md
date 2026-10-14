@@ -73,3 +73,12 @@ If it wobbles, raise `ATT_D`. If it leans too much while steering, lower `MAX_LE
 It checks GitHub on start and every 15 minutes (never mid-flight), keeps your settings, and restarts. Turn off with `AUTO_UPDATE = false`.
 
 Every flight writes `flip.log` (calibration results, then position, tilt, sensor and every thruster 5 times a second). Share it with `pastebin put flip.log`.
+
+## One-time copies
+
+For drones that fly a single delivery: set up and train one master, then copy its settings to the rest.
+
+1. **Train the master.** Fly test deliveries with the cargo weight you'll really carry, until a drop lands on target and fires (about 3 flights; each drop corrects the aim). Keep the target the same way round from the drone every time, e.g. always off the same side.
+2. **Export:** `flip export`, then `pastebin put flip.pack`.
+3. **On each copy:** `pastebin get <code> flip.pack`, then `flip clone`. Each thruster puffs and the screen says what it should be (bottom, or side with its flame direction worked out from the master's real data). Press Y, or N and say what it actually is. If the answers don't add up to the master's layout, nothing is saved.
+4. **Park it facing the same way relative to its target.** The learned aim fits deliveries where the target lies in the same direction from the drone as during training (tested within about 45 degrees, at any heading and distance). Before take-off it checks this, and if the target is more than 50 degrees off it says how far to turn the drone and asks before flying.

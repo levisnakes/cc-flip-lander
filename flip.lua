@@ -25,7 +25,7 @@
 --   INVERTED   nose engines brake the descent  (DROP without them: it falls)
 --   DEPLOY     sensor reads DEPLOY_DISTANCE: all 4 charge outputs fire at once
 
-VERSION = "2.6.1"
+VERSION = "2.7.0"
 
 -- ======================== SETTINGS ===========================
 -- To keep your own values across updates, put them in /config.lua
@@ -1295,13 +1295,6 @@ local function missionLoop()
   goal.pos = v3(S.pad.x, cruiseY, S.pad.z)
   waitUntil(function() return S.pos.y > cruiseY - 3 end,
     function() return string.format("Climbing to %.0f", cruiseY) end)
-  S.mode = "CRUISE"
-  goal.pos = v3(target.x, cruiseY, target.z)
-  waitUntil(function() return horizontalDistance(target) < ARRIVE_RADIUS end,
-    function() return string.format("%.0f blocks to go", horizontalDistance(target)) end)
-
-  -- 4. down to the flip height and stop there
-  S.mode = "APPROACH"
   local flipY = target.y + FLIP_HEIGHT
   -- Without nose engines the flip throws it sideways the same way every
   -- time and it can't steer while falling, so it flips that far short of
@@ -1316,10 +1309,18 @@ local function missionLoop()
     flipAt = v3(target.x - w.x, target.y, target.z - w.z)
     log("flipping %.1f blocks short of the target (last drop landed that far off)", math.sqrt(w.x * w.x + w.z * w.z))
   end
+  S.mode = "CRUISE"
+  goal.pos = v3(target.x, cruiseY, target.z)
+  waitUntil(function() return horizontalDistance(target) < ARRIVE_RADIUS end,
+    function() return string.format("%.0f blocks to go", horizontalDistance(target)) end)
+
+  -- 4. down to the flip height and stop there
+  S.mode = "APPROACH"
   goal.pos = v3(flipAt.x, flipY, flipAt.z)
   waitUntil(function()
     return math.abs(S.pos.y - flipY) < 1.5 and len(S.vel) < 1 and horizontalDistance(flipAt) < ARRIVE_RADIUS
   end, function() return string.format("Descending to flip height %.0f", flipY) end)
+
 
   -- Without nose engines nothing holds it up once it's flipped, so it would
   -- crash. Disarmed, it just lands upright instead.
@@ -1439,8 +1440,12 @@ local function missionLoop()
         -- the next flight flips that much further back
         local off = rotate(flipQ, v3(S.pos.x - target.x, 0, S.pos.z - target.z), true)
         local old = aim or { x = 0, z = 0 }
-        writeFile(AIM_FILE, textutils.serialize({ x = old.x + off.x, z = old.z + off.z }))
-        log("drop landed %.1f blocks off; next flight aims for it", horizontalDistance(target))
+        -- also which way the target lay from the pad, seen from the craft:
+        -- the aim only fits flights that come in from about the same side
+        local dir = rotate(flipQ, v3(target.x - S.pad.x, 0, target.z - S.pad.z), true)
+        local n = math.max(math.sqrt(dir.x * dir.x + dir.z * dir.z), 1e-6)
+        writeFile(AIM_FILE, textutils.serialize({ x = old.x + off.x, z = old.z + off.z, dx = dir.x / n, dz = dir.z / n }))
+        log("drop landed %.1f blocks off (ship frame %.1f, %.1f; world %.1f, %.1f); next flight aims for it", horizontalDistance(target), off.x, off.z, S.pos.x - target.x, S.pos.z - target.z)
       end
       if not onTarget then log("landed %.1f blocks off target: not firing", horizontalDistance(target)) end
       if ARMED and onTarget then
@@ -1622,6 +1627,160 @@ local function loadCalibration()
   cal, S.hover = c.responses, c.hover or S.hover
 end
 
+-- ============================================================ copies
+-- One drone is set up, calibrated and flown until its aim is learned; its
+-- settings then go to copies that only fly once. Peripheral names differ on
+-- a copy, so the pack stores what each thruster does instead: bottom, side
+-- pushing along a ship axis, or nose.
+
+local PACK_FILE = "flip.pack"
+
+-- thruster_105 after thruster_93 (string order would put it first)
+local function byNumber(names)
+  table.sort(names, function(a, b)
+    local na, nb = tonumber(a:match("(%d+)$")), tonumber(b:match("(%d+)$"))
+    if na and nb and na ~= nb then return na < nb end
+    return a < b
+  end)
+  return names
+end
+
+local AXIS_KEYS = { { "+x", v3(1, 0, 0) }, { "-x", v3(-1, 0, 0) }, { "+z", v3(0, 0, 1) }, { "-z", v3(0, 0, -1) } }
+local function axisKey(v)
+  local best, bd = nil, -math.huge
+  for _, a in ipairs(AXIS_KEYS) do
+    if dot(v, a[2]) > bd then best, bd = a[1], dot(v, a[2]) end
+  end
+  return best
+end
+local function axisVec(key)
+  for _, a in ipairs(AXIS_KEYS) do if a[1] == key then return a[2] end end
+end
+
+local function exportPack()
+  if not loadThrusters() then error("Not set up. Run: flip setup", 0) end
+  loadCalibration()
+  if not cal then error("Not calibrated yet. Fly it once first.", 0) end
+  local aimText = readFile(AIM_FILE)
+  local pack = { format = 1, version = VERSION, hover = S.hover, aim = aimText and textutils.unserialize(aimText),
+    order = {}, side = {}, bottom = {}, top = {} }
+  local names = {}
+  for _, th in ipairs(thrusters) do names[#names + 1] = th.name end
+  local byName = {}
+  for _, th in ipairs(thrusters) do byName[th.name] = th end
+  for _, name in ipairs(byNumber(names)) do
+    local th, c = byName[name], cal[name]
+    local entry = { F0 = c.F0, T0 = c.T0, FX = c.FX, TX = c.TX, FY = c.FY, TY = c.TY, vector = th.vector }
+    if th.role == "side" then
+      local key = axisKey(c.F0)
+      if pack.side[key] then error("Two side thrusters push the same way (" .. key .. "); can't tell copies apart", 0) end
+      pack.side[key] = entry
+      pack.order[#pack.order + 1] = "side " .. key
+    else
+      table.insert(pack[th.role], entry)
+      pack.order[#pack.order + 1] = th.role
+    end
+  end
+  writeFile(PACK_FILE, textutils.serialize(pack))
+  print("Saved " .. PACK_FILE .. ".")
+  if not pack.aim then
+    print("No learned aim yet: fly test drops with this drone until it lands on target, then export again.")
+  end
+  print("Share it:  pastebin put " .. PACK_FILE)
+end
+
+local function cloneFromPack()
+  local text = readFile(PACK_FILE)
+  if not text then error("No " .. PACK_FILE .. " here. Get one: pastebin get <code> " .. PACK_FILE, 0) end
+  local pack = textutils.unserialize(text)
+  local names = byNumber(allThrusters())
+  if #names ~= #pack.order then
+    error(string.format("This drone has %d thrusters, the master had %d. It must be an exact copy.", #names, #pack.order), 0)
+  end
+  local ok, pose = pcall(sublevel.getLogicalPose)
+  if not ok or not pose then error("Put the computer on the ship (needs CC: Sable)", 0) end
+  local o = pose.orientation
+  local q = o.v and { x = o.v.x, y = o.v.y, z = o.v.z, w = o.a } or { x = o.x, y = o.y, z = o.z, w = o.w }
+  local function flameWord(pushShip)
+    local f = mul(rotate(q, pushShip), -1)
+    if math.abs(f.x) > math.abs(f.z) then return f.x > 0 and "EAST" or "WEST" end
+    return f.z > 0 and "SOUTH" or "NORTH"
+  end
+  print(string.format("Copying the master's settings (v%s) to %d thrusters.", pack.version or "?", #names))
+  print("Each one puffs. Check it does what it says: Y/N.")
+  local roleOf, keyOf = {}, {}
+  for i, name in ipairs(names) do
+    local guess = pack.order[i]
+    local role, key = guess:match("^(%a+) ?(.*)$")
+    local expect
+    if role == "side" then expect = "SIDE thruster, flame points " .. flameWord(axisVec(key))
+    elseif role == "bottom" then expect = "BOTTOM thruster (flame down)"
+    else expect = "NOSE engine (flame up)" end
+    print("")
+    print(name .. ": " .. expect)
+    write("  Right? [Y/N] ")
+    local answer
+    parallel.waitForAny(function()
+      while true do
+        pcall(peripheral.call, name, "setPower", 3); sleep(0.4)
+        pcall(peripheral.call, name, "setPower", 0); sleep(0.8)
+      end
+    end, function()
+      while not answer do
+        local _, ch = os.pullEvent("char")
+        ch = ch:lower()
+        if ch == "y" or ch == "n" then answer = ch end
+      end
+    end)
+    pcall(peripheral.call, name, "setPower", 0)
+    print(answer:upper())
+    if answer == "n" then
+      write("  What is it? [B]ottom [S]ide [T]nose ")
+      local r
+      repeat local _, ch = os.pullEvent("char"); r = ({ b = "bottom", s = "side", t = "top" })[ch:lower()] until r
+      print(r)
+      role, key = r, ""
+      if r == "side" then
+        write("  Flame points which way? [N/E/S/W] ")
+        local flame
+        repeat
+          local _, ch = os.pullEvent("char")
+          flame = ({ n = v3(0, 0, -1), s = v3(0, 0, 1), e = v3(1, 0, 0), w = v3(-1, 0, 0) })[ch:lower()]
+        until flame
+        print("")
+        key = axisKey(rotate(q, mul(flame, -1), true))
+      end
+    end
+    roleOf[name], keyOf[name] = role, key
+  end
+  -- every side direction once, and as many bottoms / nose engines as the master
+  local cfg, responses, push, used = { bottom = {}, side = {}, top = {} }, {}, {}, {}
+  local nextOf = { bottom = 1, top = 1 }
+  for _, name in ipairs(names) do
+    local role, key = roleOf[name], keyOf[name]
+    local entry
+    if role == "side" then
+      entry = pack.side[key]
+      if not entry or used[key] then error("Side directions don't match the master (" .. key .. "). Nothing saved.", 0) end
+      used[key] = true
+      push[name] = axisVec(key)
+    else
+      entry = pack[role][nextOf[role]]
+      if not entry then error("More " .. role .. " thrusters than the master had. Nothing saved.", 0) end
+      nextOf[role] = nextOf[role] + 1
+    end
+    table.insert(cfg[role], name)
+    responses[name] = { F0 = entry.F0, T0 = entry.T0, FX = entry.FX, TX = entry.TX, FY = entry.FY, TY = entry.TY }
+  end
+  cfg.push = push
+  writeFile(CFG_FILE, textutils.serialize(cfg))
+  writeFile(CAL_FILE, textutils.serialize({ responses = responses, hover = pack.hover, format = CAL_FORMAT }))
+  if pack.aim then writeFile(AIM_FILE, textutils.serialize(pack.aim))
+  elseif fs.exists(AIM_FILE) then fs.delete(AIM_FILE) end
+  print("")
+  print("Done: settings, calibration" .. (pack.aim and " and learned aim" or "") .. " copied. Ready to fly.")
+end
+
 -- "x y z", "x,y,z" or three separate answers
 local function parseTarget(text)
   local n = {}
@@ -1782,6 +1941,14 @@ if args[1] == "setup" then
   setup()
   return
 end
+if args[1] == "export" then
+  exportPack()
+  return
+end
+if args[1] == "clone" then
+  cloneFromPack()
+  return
+end
 if args[1] == "recal" then
   if fs.exists(CAL_FILE) then fs.delete(CAL_FILE) end
   if fs.exists(AIM_FILE) then fs.delete(AIM_FILE) end
@@ -1834,6 +2001,34 @@ print("")
 
 local x, y, z = tonumber(args[1]), tonumber(args[2]), tonumber(args[3])
 if x and y and z then S.target = v3(x, y, z) else S.target = askTarget() end
+
+-- The learned aim fits flights where the target lies the same way from the
+-- drone as in the flights it learned from (within ~45 deg tested).
+do
+  local saved = count.top == 0 and readFile(AIM_FILE)
+  local aim = saved and textutils.unserialize(saved)
+  local ok, pose = pcall(sublevel.getLogicalPose)
+  if aim and aim.dx and ok and pose then
+    local o = pose.orientation
+    local q = o.v and { x = o.v.x, y = o.v.y, z = o.v.z, w = o.a } or { x = o.x, y = o.y, z = o.z, w = o.w }
+    local d = rotate(q, v3(aim.dx, 0, aim.dz))            -- trained direction, world, as parked now
+    local t = v3(S.target.x - pose.position.x, 0, S.target.z - pose.position.z)
+    local tn = math.sqrt(t.x * t.x + t.z * t.z)
+    if tn > 1 then
+      local ang = math.deg(math.acos(clamp((d.x * t.x + d.z * t.z) / tn, -1, 1)))
+      local turn = (d.x * t.z - d.z * t.x) > 0 and "clockwise" or "counter-clockwise"
+      if ang > 50 then
+        print(string.format("The target is %.0f deg away from the direction this drone learned its aim on.", ang))
+        print(string.format("Turn the drone about %.0f deg %s (seen from above) for an accurate drop.", ang, turn))
+        write("Fly anyway? [y/N] ")
+        local a = read()
+        if not a or a:lower() ~= "y" then return end
+      else
+        print(string.format("Facing check: target %.0f deg off the learned direction - OK.", ang))
+      end
+    end
+  end
+end
 
 if fs then logFile = fs.open(LOG_FILE, "w") end
 logStart = now()
