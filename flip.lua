@@ -25,7 +25,7 @@
 --   INVERTED   nose engines brake the descent  (DROP without them: it falls)
 --   DEPLOY     sensor reads DEPLOY_DISTANCE: all 4 charge outputs fire at once
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 
 -- ======================== SETTINGS ===========================
 -- To keep your own values across updates, put them in /config.lua
@@ -486,7 +486,9 @@ local function liftOnly()
   if bodyUp().y > 0.95 and not S.testing then S.hover = clamp(S.hover + 0.05 * err * dt, 0, 1) end
   local power = clamp(S.hover + 0.15 * err, 0, 1)
   -- held still during a nozzle test, or its reaction would be measured too
-  if S.testing then power = S.testPower or power else S.testPower = power end
+  -- (a regular side thruster's test only looks sideways, so height control
+  -- keeps going: frozen mid-climb it could sink into the ground)
+  if S.testing and S.testing.vector then power = S.testPower or power else S.testPower = power end
   local known, helpers = {}, {}
   for _, th in ipairs(thrusters) do
     if th ~= S.testing then th.ax, th.ay = 0, 0 end
@@ -500,8 +502,10 @@ local function liftOnly()
       -- flame direction from setup once a reading has shown which way round
       -- those were typed. Not during tests.
       if th.role == "side" and not S.testing and S.ctl == "lift" then
+        -- (the confirmed setup direction first: it can't be thrown off by
+        -- a reading taken while other thrusters were still spinning down)
         local c = cal and cal[th.name]
-        local tq = c and c.T0 or (th.pushDir and S.dirSign and mul(cross(UP, th.pushDir), 0.5 * S.dirSign))
+        local tq = (th.pushDir and S.dirSign and mul(cross(UP, th.pushDir), 0.5 * S.dirSign)) or (c and c.T0)
         if tq then helpers[#helpers + 1] = { th = th, tq = v3(tq.x, 0, tq.z) } end
       end
     end
@@ -608,7 +612,11 @@ local function controlLoop()
         -- fade out with the lean and over the flip
         local fade = math.max(0, 1 - (now() - (S.flipStart or now())) / (S.flipTime or FLIP_SECONDS))
         local up = bodyUp().y
-        lim = { side = lim.side, bottom = { 0, clamp((up - 0.3) / 0.5, 0, 1) * fade },
+        -- With no nose engines it falls after the flip anyway, and the main
+        -- engines firing while tipped only throw it sideways, off the target.
+        -- They stop once it leans past ~15 deg.
+        local bottomMax = S.hasNose and clamp((up - 0.3) / 0.5, 0, 1) or clamp((up - 0.96) / 0.03, 0, 1)
+        lim = { side = lim.side, bottom = { 0, bottomMax * fade },
           top = { 0, clamp((-up - 0.3) / 0.5, 0, 1) } }
       end
       -- While flipping, turning matters most: side thrusters near the top
@@ -667,6 +675,53 @@ local function doublet(apply, delta, spinLimit)
   log("  doublet %.2fs/%.2fs", dur, d2)
   local F = mul(sub(fPlus, fMinus), 1 / (2 * delta))
   local T = mul(sub(mul(dwPlus, 1 / dur), mul(dwMinus, 1 / d2)), 1 / (2 * delta))
+  return F, T
+end
+
+-- One-way test for a thruster that can't push back (a regular side thruster):
+-- on until it starts to turn the craft, off, then keep measuring while the
+-- thruster spins down. Thrusters keep pushing for a while after they're
+-- switched off, so the whole response (on + spin-down) counts. Nothing is
+-- subtracted, since the spin-down half pushes the same way as the on half.
+-- Returns the response per unit of throttle per second it was on.
+local function pulse(apply, level, spinLimit)
+  -- let the leveling thrusters (just switched off) spin down, until the
+  -- turning speeds up steadily (a center of mass a bit off does that), then
+  -- take that drift, per second
+  apply(0)   -- (it may have been helping level until now)
+  local lastW, lastT, t1, lastAcc, steady = S.omega, now(), now(), nil, 0
+  while S.dirSign do   -- (before the first reading nothing was leveling)
+    waitSeconds(0.15)
+    local acc = mul(sub(S.omega, lastW), 1 / math.max(now() - lastT, 0.05))
+    steady = (lastAcc and len(sub(acc, lastAcc)) < 0.02) and steady + 1 or 0
+    lastW, lastT, lastAcc = S.omega, now(), acc
+    if steady >= 2 or now() - t1 > 1.5 then break end
+  end
+  local wa, ta = S.omega, now()
+  waitSeconds(0.3)
+  local alpha0 = mul(sub(S.omega, wa), 1 / math.max(now() - ta, 0.05))
+  apply(level)
+  local fOn, dwOn, dur = measure(function(t, spin)
+    return t >= CAL_PULSE or (spin > spinLimit and t >= CAL_MIN_PULSE)
+  end)
+  apply(0)
+  -- spin-down: until the turning stops speeding up (or 1 s)
+  local peak, quiet = 0, 0
+  lastW, lastT = S.omega, now()
+  local fOff, dwOff, d2 = measure(function(t)
+    local dt = now() - lastT
+    if dt > 0 then
+      local acc = len(sub(S.omega, lastW)) / dt
+      peak = math.max(peak, acc)
+      quiet = acc < 0.25 * peak and quiet + dt or 0
+      lastW, lastT = S.omega, now()
+    end
+    return t >= 1 or (t >= 0.4 and quiet >= 0.15)
+  end)
+  log("  pulse %.2fs on, %.2fs spin-down", dur, d2)
+  local total = dur + d2
+  local F = mul(add(mul(fOn, dur), mul(fOff, d2)), 1 / (dur * level))
+  local T = mul(sub(add(dwOn, dwOff), mul(alpha0, total)), 1 / (dur * level))
   return F, T
 end
 
@@ -779,8 +834,9 @@ local function testThruster(th, base, part, c, partner, partnerT)
     -- it doesn't turn the craft); leveling pauses while S.testing is set.
     S.testing, S.ctl = th, "lift"
     -- It can't push the other way, so the pulse leaves the craft turning;
-    -- stop at a small turn rate the thrusters measured so far can undo.
-    c.F0, c.T0 = doublet(function(d) th.t = d > 0 and 2 * d or 0 end, CAL_STEP, 0.1)
+    -- stop at a small turn rate (it keeps turning faster while the thruster
+    -- spins down) that its partner's pulse then undoes.
+    c.F0, c.T0 = pulse(function(l) th.t = l end, CAL_STEP, 0.03)
     th.t = 0
     S.testing = nil
   elseif part == "throttle" then
@@ -878,6 +934,14 @@ local function calibrate()
   -- puff's tilt is undone by its partner's, and once measured they help
   -- hold the craft level during everything after.
   if not S.vectorLift then
+    -- let the climb settle a moment (slow thrusters overshoot it); nothing
+    -- levels the craft yet, so not for long
+    S.ctl = "lift"
+    local still, t0 = nil, now()
+    while now() - t0 < 1.5 and tiltDeg() < 2 do
+      waitFix()
+      if math.abs(S.vel.y) < 0.3 then still = still or now(); if now() - still > 0.5 then break end else still = nil end
+    end
     local todo = {}
     for _, th in ipairs(thrusters) do if th.role == "side" and not th.vector then todo[#todo + 1] = th end end
     while #todo > 0 do
@@ -890,6 +954,15 @@ local function calibrate()
       end
       if not b and #todo > 0 then b = table.remove(todo, 1) end
       for _, th in ipairs({ a, b }) do
+        -- level and still before each puff (once one reading has shown which
+        -- way the setup directions run, every side thruster helps level)
+        S.status = "Leveling"
+        S.ctl = "lift"
+        local calm, t1 = nil, now()
+        while S.dirSign and now() - t1 < 5 do
+          waitFix()
+          if tiltDeg() < 4 and len(S.omega) < 0.03 then calm = calm or now(); if now() - calm > 0.3 then break end else calm = nil end
+        end
         S.status = "Testing side thruster " .. th.name
         local c = testThruster(th, CAL_SIDE_THROTTLE, "throttle")
         -- The first clear reading says whether setup's flame directions
@@ -903,7 +976,12 @@ local function calibrate()
           end
         end
         -- readings taken while tipping can be off; keep only clear ones
-        if len(c.T0) > 1e-6 and len(c.F0) > 1e-6 and math.abs(dot(c.T0, cross(UP, mul(c.F0, 1 / len(c.F0))))) > 0.5 * len(c.T0) then
+        -- (and, once the setup directions are confirmed, ones that agree)
+        local agrees = not (S.dirSign and th.pushDir)
+          or dot(c.T0, cross(UP, mul(th.pushDir, S.dirSign))) > 0.7 * len(c.T0)
+        if not agrees then
+          log("reading for %s disagrees with its setup direction, not kept", th.name)
+        elseif len(c.T0) > 1e-6 and len(c.F0) > 1e-6 and math.abs(dot(c.T0, cross(UP, mul(c.F0, 1 / len(c.F0))))) > 0.5 * len(c.T0) then
           cal[th.name] = c
         else
           log("unclear reading for %s, will retest", th.name)
