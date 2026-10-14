@@ -25,7 +25,7 @@
 --   INVERTED   nose engines brake the descent  (DROP without them: it falls)
 --   DEPLOY     sensor reads DEPLOY_DISTANCE: all 4 charge outputs fire at once
 
-VERSION = "2.4.0"
+VERSION = "2.5.0"
 
 -- ======================== SETTINGS ===========================
 -- To keep your own values across updates, put them in /config.lua
@@ -112,6 +112,8 @@ if fs and fs.exists("/config.lua") then
 end
 
 local CFG_FILE, CAL_FILE, LOG_FILE = "flip.cfg", "flip.cal", "flip.log"
+-- where the last drop landed from the target, ship frame (no nose engines)
+local AIM_FILE = "flip.aim"
 local VECTOR_TYPES = { vector_thruster = true, creative_vector_thruster = true, liquid_vector_thruster = true }
 local REGULAR_TYPES = { thruster = true, creative_thruster = true, solid_fuel_thruster = true, ion_thruster = true }
 
@@ -942,9 +944,19 @@ local function calibrate()
       waitFix()
       if math.abs(S.vel.y) < 0.3 then still = still or now(); if now() - still > 0.5 then break end else still = nil end
     end
-    local todo = {}
-    for _, th in ipairs(thrusters) do if th.role == "side" and not th.vector then todo[#todo + 1] = th end end
-    while #todo > 0 do
+    local todo, allDirs = {}, true
+    for _, th in ipairs(thrusters) do
+      if th.role == "side" and not th.vector then
+        todo[#todo + 1] = th
+        if not th.pushDir then allDirs = false end
+      end
+    end
+    -- Every test switches the leveling off, and a tall craft tips fast
+    -- without it. So with flame directions for every side thruster, one
+    -- clean reading is enough: it says which way round they were typed and
+    -- how hard a side thruster turns the craft, and the rest follow.
+    local enough = false
+    while #todo > 0 and not enough do
       local a = table.remove(todo, 1)
       local b = nil
       if a.pushDir then
@@ -983,6 +995,7 @@ local function calibrate()
           log("reading for %s disagrees with its setup direction, not kept", th.name)
         elseif len(c.T0) > 1e-6 and len(c.F0) > 1e-6 and math.abs(dot(c.T0, cross(UP, mul(c.F0, 1 / len(c.F0))))) > 0.5 * len(c.T0) then
           cal[th.name] = c
+          if allDirs and S.dirSign then enough = true break end
         else
           log("unclear reading for %s, will retest", th.name)
         end
@@ -1020,8 +1033,24 @@ local function calibrate()
     end
   end
   local hover = S.hover
+  -- Regular bottom thrusters with the side thrusters leveling: their tests
+  -- would switch the leveling off again, so they aren't run. The hover power
+  -- says how strong they are (together they hold up the weight); leveling is
+  -- left to the side thrusters, so no turning is counted for them.
+  local skipBottoms = not S.vectorLift and S.dirSign ~= nil
+  if skipBottoms then
+    local nb = 0
+    for _, th in ipairs(thrusters) do if th.role == "bottom" then nb = nb + 1 end end
+    local up = S.gravity / (nb * math.max(S.hover, 0.05))
+    for _, th in ipairs(thrusters) do
+      if th.role == "bottom" then
+        cal[th.name] = { F0 = v3(0, up, 0), T0 = v3(), FX = v3(), TX = v3(), FY = v3(), TY = v3() }
+      end
+    end
+    log("bottom thrusters from hover power %.2f: %.2f each, not tested", S.hover, up)
+  end
   for i, th in ipairs(thrusters) do
-    if th.role == "bottom" then
+    if th.role == "bottom" and not skipBottoms then
       S.status = "Testing bottom thruster " .. i
       for try = 1, 3 do
         if S.vectorLift then settle(1.5) else
@@ -1249,9 +1278,22 @@ local function missionLoop()
   -- 4. down to the flip height and stop there
   S.mode = "APPROACH"
   local flipY = target.y + FLIP_HEIGHT
-  goal.pos = v3(target.x, flipY, target.z)
+  -- Without nose engines the flip throws it sideways the same way every
+  -- time and it can't steer while falling, so it flips that far short of
+  -- the target (learned from the last drop).
+  local hasNose = false
+  for _, th in ipairs(thrusters) do if th.role == "top" then hasNose = true end end
+  local flipAt = target
+  local aimSaved = (not hasNose) and readFile(AIM_FILE)
+  local aim = aimSaved and textutils.unserialize(aimSaved)
+  if aim then
+    local w = rotate(S.orient, v3(aim.x, 0, aim.z))
+    flipAt = v3(target.x - w.x, target.y, target.z - w.z)
+    log("flipping %.1f blocks short of the target (last drop landed that far off)", math.sqrt(w.x * w.x + w.z * w.z))
+  end
+  goal.pos = v3(flipAt.x, flipY, flipAt.z)
   waitUntil(function()
-    return math.abs(S.pos.y - flipY) < 1.5 and len(S.vel) < 1 and horizontalDistance(target) < ARRIVE_RADIUS
+    return math.abs(S.pos.y - flipY) < 1.5 and len(S.vel) < 1 and horizontalDistance(flipAt) < ARRIVE_RADIUS
   end, function() return string.format("Descending to flip height %.0f", flipY) end)
 
   -- Without nose engines nothing holds it up once it's flipped, so it would
@@ -1302,7 +1344,8 @@ local function missionLoop()
 
   S.mode = "FLIP"
   S.ctl = "flip"
-  goal.pos, goal.vy = v3(target.x, S.pos.y, target.z), 0
+  goal.pos, goal.vy = v3(flipAt.x, S.pos.y, flipAt.z), 0
+  local flipQ = S.orient
   local axis = rotate(S.orient, axisShip)
   axis.y = 0
   axis = mul(axis, 1 / math.max(len(axis), 1e-6))
@@ -1354,6 +1397,14 @@ local function missionLoop()
     else reached = S.pos.y - target.y - lead <= DEPLOY_DISTANCE end
     if reached and tiltDeg() > 120 then
       local onTarget = horizontalDistance(target) <= DEPLOY_RADIUS
+      if nose == 0 then
+        -- remember where it came down (ship frame as it was at the flip) so
+        -- the next flight flips that much further back
+        local off = rotate(flipQ, v3(S.pos.x - target.x, 0, S.pos.z - target.z), true)
+        local old = aim or { x = 0, z = 0 }
+        writeFile(AIM_FILE, textutils.serialize({ x = old.x + off.x, z = old.z + off.z }))
+        log("drop landed %.1f blocks off; next flight aims for it", horizontalDistance(target))
+      end
       if not onTarget then log("landed %.1f blocks off target: not firing", horizontalDistance(target)) end
       if ARMED and onTarget then
         fireCharges()
@@ -1494,6 +1545,7 @@ local function setup()
   end
   writeFile(CFG_FILE, textutils.serialize(cfg))
   if fs.exists(CAL_FILE) then fs.delete(CAL_FILE) end
+  if fs.exists(AIM_FILE) then fs.delete(AIM_FILE) end
   print("")
   print(string.format("Saved: %d bottom, %d side, %d nose. Calibration runs on the next flight.",
     #cfg.bottom, #cfg.side, #cfg.top))
@@ -1694,6 +1746,7 @@ if args[1] == "setup" then
 end
 if args[1] == "recal" then
   if fs.exists(CAL_FILE) then fs.delete(CAL_FILE) end
+  if fs.exists(AIM_FILE) then fs.delete(AIM_FILE) end
   print("Calibration cleared; it runs again on the next flight.")
   return
 end

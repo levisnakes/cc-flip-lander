@@ -16,7 +16,7 @@ Thruster roles (you pick them in `flip setup`):
 wget https://raw.githubusercontent.com/levisnakes/cc-flip-lander/main/flip.lua flip.lua
 ```
 
-Then run `flip setup`. Each thruster puffs at low power (or a vector nozzle wiggles) in turn, and you press **B**, **S**, **T** or **I** (ignore). For each side thruster it also asks which way its flame points (**N/E/S/W**, see F3). Right after lift-off it puffs the side thrusters in opposite pairs and checks those answers against what it measures (if they were typed backwards, it flips them), then the side thrusters hold the craft level for the rest of calibration.
+Then run `flip setup`. Each thruster puffs at low power (or a vector nozzle wiggles) in turn, and you press **B**, **S**, **T** or **I** (ignore). For each side thruster it also asks which way its flame points (**N/E/S/W**, see F3). Right after lift-off it puffs one side thruster and checks those answers against what it measures (if they were typed backwards, it flips them). After that the side thrusters hold the craft level.
 
 ## Fly
 
@@ -26,11 +26,11 @@ flip <x> <y> <z>
 
 Or just `flip` and type the target. Y is the ground height at the target. Hold **Ctrl+T** to abort; every output turns off.
 
-1. **Calibrate** (first flight only, about 1–2 minutes): right after lift-off it pulses every thruster to learn how each one pushes and turns the craft. Nothing levels it until then, so **the bottom thrusters must sit evenly around the center of mass**, or it tips on take-off. The result is saved to `flip.cal`. Run `flip recal` after rebuilding the craft.
+1. **Calibrate** (first flight only, a few seconds): right after lift-off it puffs one side thruster to learn how hard the side thrusters turn the craft and which way the setup directions run. It works out the rest from those directions and the hover power, so the leveling never has to switch off for long. Nothing levels it before that first puff, so **the bottom thrusters must sit evenly around the center of mass**, or it tips on take-off. The result is saved to `flip.cal`. Run `flip recal` after rebuilding the craft.
 2. **Climb** 20 blocks.
 3. **Cruise** to the target.
 4. **Approach**: sinks to `FLIP_HEIGHT` (160) above the target and holds still.
-5. **Pop-up and flip**: climbs fast, then rolls over. A 12-block craft takes about 7 seconds and drops around 60 blocks doing it, which is why `FLIP_HEIGHT` is high.
+5. **Pop-up and flip**: climbs fast, then rolls over. A 12-block craft takes about 7 seconds and drops around 60 blocks doing it, which is why `FLIP_HEIGHT` is high. With no nose engines it then falls upside down and can't steer, and the flip throws it sideways the same way every time. Each drop saves where it landed (`flip.aim`), and the next flight flips that far short of the target, so it lands closer every flight. Expect the first one or two drops to miss and not fire (`DEPLOY_RADIUS`).
 6. **Inverted descent**: the nose engines brake and steer it back over the target, slowing to `FINAL_SPEED` near the ground.
 7. **Deploy**: when the sensor reads `DEPLOY_DISTANCE` (2.5), all 4 `CHARGES` switch on in the same tick.
 
