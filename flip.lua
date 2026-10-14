@@ -1196,9 +1196,9 @@ local function setup()
   local names = allThrusters()
   if #names == 0 then error("No thrusters found. Connect them with wired modems.", 0) end
   local cfg = { bottom = {}, side = {}, top = {} }
-  print(string.format("Found %d thrusters. Each one will puff or wiggle.", #names))
-  print("  B = bottom (lift)   S = side   T = top/nose (points the")
-  print("  other way, holds it up when flipped)   I = ignore")
+  print(string.format("Found %d thrusters. Each one puffs in turn.", #names))
+  print("B = bottom (lift)   S = side   I = ignore")
+  print("T = nose engine (only if you added some)")
   for _, name in ipairs(names) do
     local vector = VECTOR_TYPES[peripheral.getType(name)]
     print("")
