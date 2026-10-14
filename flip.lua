@@ -25,7 +25,7 @@
 --   INVERTED   nose engines brake the descent  (DROP without them: it falls)
 --   DEPLOY     sensor reads DEPLOY_DISTANCE: all 4 charge outputs fire at once
 
-VERSION = "2.5.0"
+VERSION = "2.6.0"
 
 -- ======================== SETTINGS ===========================
 -- To keep your own values across updates, put them in /config.lua
@@ -98,6 +98,11 @@ MAX_ACCEL = 8           -- blocks/s^2, horizontal
 MAX_LEAN = 20           -- most it leans to steer (degrees), tall crafts
 ATT_P = 5               -- attitude stiffness; raise if it lags the flip
 ATT_D = 4               -- attitude damping; raise if it wobbles
+-- Upright the thrusters' slow spin-up makes stiff leveling overshoot and
+-- swing (it tipped in flight 6), so it holds level more gently; the flip
+-- keeps ATT_P/ATT_D.
+HOLD_P = 3
+HOLD_D = 4
 SIDE_MIN = 0.15         -- vector side thrusters never go below this in flight,
                         -- so the nozzles always have something to steer
 
@@ -391,6 +396,17 @@ local function allocate(wantF, wantT, limits, wForce)
       F, T = add(F, mul(g, th.t)), add(T, mul(h, th.t))
     end
   end
+  -- Bottom thrusters not measured for turning (skipped in calibration) all
+  -- look the same to the steps above, which then split the lift unevenly
+  -- (4/4/15/15) - and that does turn the craft. Same power on each.
+  local flat, sum = {}, 0
+  for _, a in ipairs(act) do
+    if a.th.role == "bottom" and len(a.c.T0) < 1e-6 and not a.th.vector then
+      flat[#flat + 1] = a
+      sum = sum + a.th.t
+    end
+  end
+  for _, a in ipairs(flat) do a.th.t = clamp(sum / #flat, a.lo, a.hi) end
   return F, T
 end
 
@@ -412,7 +428,9 @@ local function attitudeTorque()
   elseif c < 0 then err = mul(rotate(S.orient, v3(1, 0, 0)), 0.6) end
   local errShip = rotate(S.orient, err, true)
   local ffShip = rotate(S.orient, att.ff, true)
-  return add(sub(mul(errShip, ATT_P), mul(S.omega, ATT_D)), ffShip)
+  local p, d = ATT_P, ATT_D
+  if S.ctl ~= "flip" and S.ctl ~= "inverted" then p, d = HOLD_P, HOLD_D end
+  return add(sub(mul(errShip, p), mul(S.omega, d)), ffShip)
 end
 
 -- Wanted velocity -> wanted acceleration (world), with a slow integrator.
@@ -428,7 +446,8 @@ local function wantAccel(wantVel)
   local busy = S.ctl == "flip" or S.ctl == "inverted"
   local hI = busy and 0 or VEL_I
   local hGain = busy and 0.6 * VEL_GAIN or VEL_GAIN
-  if S.leanSteer then hGain, hI = 0.35 * VEL_GAIN, 0.25 * hI end
+  -- (it learns steady pushes slowly: faster, it circles the target)
+  if S.leanSteer then hGain, hI = 0.35 * VEL_GAIN, 0.06 * hI end
   S.velI = add(S.velI, v3(err.x * hI * dt, err.y * VEL_I * dt, err.z * hI * dt))
   S.velI = v3(clamp(S.velI.x, -3, 3), clamp(S.velI.y, -6, 6), clamp(S.velI.z, -3, 3))
   local a = add(v3(err.x * hGain, err.y * VEL_GAIN, err.z * hGain), S.velI)
@@ -1128,9 +1147,12 @@ local function calibrate()
   for _, th in ipairs(thrusters) do
     local c = cal[th.name]
     if th.role ~= "bottom" and not th.vector and n[th.ptype] and len(c.F0) > 1e-6 then
+      -- Only the push. The turn reading counts the whole puff, spin-down
+      -- included, so it isn't low; the push reading is the unreliable one
+      -- (a small puff next to a craft already sliding and tipping).
       local k = sum[th.ptype] / n[th.ptype] / len(c.F0)
-      c.F0, c.T0 = mul(c.F0, k), mul(c.T0, k)
-      log("%s strength x%.2f to match the bottom thrusters", th.name, k)
+      c.F0 = mul(c.F0, k)
+      log("%s push x%.2f to match the bottom thrusters", th.name, k)
     end
   end
   settle(2)
