@@ -25,7 +25,7 @@
 --   INVERTED   nose engines brake the descent  (DROP without them: it falls)
 --   DEPLOY     sensor reads DEPLOY_DISTANCE: all 4 charge outputs fire at once
 
-VERSION = "2.6.0"
+VERSION = "2.6.1"
 
 -- ======================== SETTINGS ===========================
 -- To keep your own values across updates, put them in /config.lua
@@ -119,6 +119,9 @@ end
 local CFG_FILE, CAL_FILE, LOG_FILE = "flip.cfg", "flip.cal", "flip.log"
 -- where the last drop landed from the target, ship frame (no nose engines)
 local AIM_FILE = "flip.aim"
+-- bumped when calibration changes enough that older flip.cal files are wrong
+-- (v2.5 scaled the side thrusters' turn strength 3x too low)
+local CAL_FORMAT = 2
 local VECTOR_TYPES = { vector_thruster = true, creative_vector_thruster = true, liquid_vector_thruster = true }
 local REGULAR_TYPES = { thruster = true, creative_thruster = true, solid_fuel_thruster = true, ion_thruster = true }
 
@@ -1162,7 +1165,7 @@ local function calibrate()
     out[name] = { F0 = c.F0, T0 = c.T0, FX = c.FX, TX = c.TX, FY = c.FY, TY = c.TY }
   end
   goal.maxSpeed, goal.brake = nil, nil
-  writeFile(CAL_FILE, textutils.serialize({ responses = out, hover = S.hover }))
+  writeFile(CAL_FILE, textutils.serialize({ responses = out, hover = S.hover, format = CAL_FORMAT }))
   S.status = "Calibration saved to " .. CAL_FILE
 end
 
@@ -1368,6 +1371,7 @@ local function missionLoop()
   S.ctl = "flip"
   goal.pos, goal.vy = v3(flipAt.x, S.pos.y, flipAt.z), 0
   local flipQ = S.orient
+  local flipStartY = S.pos.y
   local axis = rotate(S.orient, axisShip)
   axis.y = 0
   axis = mul(axis, 1 / math.max(len(axis), 1e-6))
@@ -1388,6 +1392,17 @@ local function missionLoop()
       log("FLIP failed: tilt %.0f after %.1fs", tiltDeg(), now() - t0)
       S.flipFailed = true
       break
+    end
+    -- still finishing the flip when the ground comes up: go straight to the
+    -- drop's trigger, mostly over is enough to release
+    if tiltDeg() > 120 and S.ground and S.ground < 15 then break end
+    -- came down before it got over (on its side): stop, save the fuel
+    if now() - t0 > 2 and len(S.vel) < 0.5 and math.abs(S.omega.x) + math.abs(S.omega.z) < 0.05 and S.pos.y < flipStartY - 20 then
+      S.ctl = "off"; allOff()
+      S.mode = "LANDED"
+      S.status = string.format("Came down mid-flip (%.0f deg), %.0f blocks off target", tiltDeg(), horizontalDistance(target))
+      log("came down mid-flip at %.0f deg, %.1f blocks off: thrusters off", tiltDeg(), horizontalDistance(target))
+      return
     end
   until s >= 1 and tiltDeg() > 150
   if S.flipFailed then
@@ -1600,6 +1615,7 @@ local function loadCalibration()
   if not saved then return end
   local c = textutils.unserialize(saved)
   if not c or not c.responses then return end
+  if (c.format or 1) < CAL_FORMAT then return end  -- from an older version: recalibrate
   for _, th in ipairs(thrusters) do
     if not c.responses[th.name] then return end  -- thrusters changed: recalibrate
   end
