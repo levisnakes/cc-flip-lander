@@ -25,7 +25,7 @@
 --   INVERTED   nose engines brake the descent  (DROP without them: it falls)
 --   DEPLOY     sensor reads DEPLOY_DISTANCE: all 4 charge outputs fire at once
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 
 -- ======================== SETTINGS ===========================
 -- To keep your own values across updates, put them in /config.lua
@@ -475,16 +475,19 @@ S.ctl = "off"   -- "off" | "manual" (calibration drives outputs) | "lift" | a LI
 -- power. Bottom thrusters whose throttle is already measured get nudged up
 -- or down around it to hold the craft level, so leveling improves with every
 -- thruster tested.
+local lastLift = nil
 local function liftOnly()
   local t = now()
-  local dt = lastCtl and math.min(t - lastCtl, 0.5) or 0
+  -- (a gap means a test was running; don't count it as one long step)
+  local dt = lastLift and math.min(t - lastLift, 0.1) or 0
+  lastLift = t
   lastCtl = t
   local err = wantVelocity().y - S.vel.y
   if bodyUp().y > 0.95 and not S.testing then S.hover = clamp(S.hover + 0.05 * err * dt, 0, 1) end
   local power = clamp(S.hover + 0.15 * err, 0, 1)
   -- held still during a nozzle test, or its reaction would be measured too
   if S.testing then power = S.testPower or power else S.testPower = power end
-  local known = {}
+  local known, helpers = {}, {}
   for _, th in ipairs(thrusters) do
     if th ~= S.testing then th.ax, th.ay = 0, 0 end
     if th.role == "bottom" then
@@ -492,9 +495,17 @@ local function liftOnly()
       if cal and cal[th.name] then known[#known + 1] = th end
     elseif th ~= S.testing and th ~= S.partner then
       th.t = 0
+      -- Side thrusters help level: measured ones by their calibration,
+      -- the rest by the push direction given in setup (near the top, a push
+      -- tips the top that way). Not during tests, so readings stay clean.
+      if th.role == "side" and not S.testing and S.ctl == "lift" then
+        local c = cal and cal[th.name]
+        local tq = c and c.T0 or (th.pushDir and mul(cross(UP, th.pushDir), 0.5))
+        if tq then helpers[#helpers + 1] = { th = th, tq = v3(tq.x, 0, tq.z) } end
+      end
     end
   end
-  if #known == 0 then return end
+  if #known == 0 and #helpers == 0 then return end
   -- with every bottom thruster measured, lean (up to 20 deg) to hold
   -- position; during a test it just holds level
   local nb = 0
@@ -518,6 +529,11 @@ local function liftOnly()
       T = sub(T, mul(h, th.nudge))
       th.nudge = clamp(dot(sub(want, T), h) / (dot(h, h) + 0.05), -0.3, 0.3)
       T = add(T, mul(h, th.nudge))
+    end
+    for _, hp in ipairs(helpers) do
+      T = sub(T, mul(hp.tq, hp.th.t))
+      hp.th.t = clamp(dot(sub(want, T), hp.tq) / (dot(hp.tq, hp.tq) + 0.05), 0, 0.5)
+      T = add(T, mul(hp.tq, hp.th.t))
     end
   end
   -- no net change in lift, only tilt (once every bottom thruster is known)
@@ -572,6 +588,8 @@ local function controlLoop()
         if m > maxLean then h = mul(h, maxLean / m) end
         local dir = add(UP, h)
         dir = mul(dir, 1 / len(dir))
+        -- while calibrating, only some thrusters are known: just hold level
+        if S.mode == "CALIBRATE" then dir = UP end
         if S.ctl == "inverted" then
           -- the nose engines push along -top: top points down, leaning away
           att.want = mul(dir, -1)
@@ -747,6 +765,9 @@ local function testThruster(th, base, part, c, partner, partnerT)
   th.ax, th.ay = 0, 0
   if part == "throttle" and th.role == "bottom" then
     S.ctl = "manual"
+    -- every bottom thruster at hover power (not wherever the leveling had
+    -- them that instant), so the craft holds height during the test
+    for _, o in ipairs(thrusters) do o.t = o.role == "bottom" and base or 0 end
     th.t = base
     flush(); waitSeconds(0.3)
     c.F0, c.T0 = doublet(function(d) th.t = base + d; flush() end, CAL_STEP)
@@ -850,9 +871,20 @@ local function calibrate()
   for i, th in ipairs(thrusters) do
     if th.role == "bottom" then
       S.status = "Testing bottom thruster " .. i
-      if S.vectorLift then settle(1.5) else S.ctl = "lift"; waitSeconds(0.3) end
-      hover = S.hover
-      cal[th.name] = testThruster(th, hover, "throttle")
+      for try = 1, 3 do
+        if S.vectorLift then settle(1.5) else
+          -- wait (briefly) for it to stop rising or sinking
+          S.ctl = "lift"; waitSeconds(0.3)
+          local t0 = now()
+          while math.abs(S.vel.y) > 0.4 and now() - t0 < 3 do waitFix() end
+        end
+        hover = S.hover
+        local c = testThruster(th, hover, "throttle")
+        -- a bottom thruster has to push up; anything else was a bad reading
+        if c.F0.y > 0.5 * len(c.F0) and c.F0.y > 0.5 then cal[th.name] = c break end
+        log("bad reading for %s (F0 %s), try %d", th.name, fmtV(c.F0), try)
+        if try == 3 then error("Couldn't measure bottom thruster " .. th.name .. ". Is it pointing straight down?", 0) end
+      end
     end
   end
   setScale()
@@ -901,6 +933,24 @@ local function calibrate()
     cal[th.name] = testThruster(th, CAL_SIDE_THROTTLE, "aim", c, partner, partnerT)
     th.t, th.ax, th.ay = 0, 0, 0
     if partner then partner.t = 0 end
+  end
+  -- Pulsed from off, side and nose thrusters read low (they're still
+  -- spinning up). The same kind of thruster as the bottom ones, whose
+  -- strength the hover power pins down, must be just as strong.
+  local sum, n = {}, {}
+  for _, th in ipairs(thrusters) do
+    if th.role == "bottom" and not th.vector then
+      sum[th.ptype] = (sum[th.ptype] or 0) + len(cal[th.name].F0)
+      n[th.ptype] = (n[th.ptype] or 0) + 1
+    end
+  end
+  for _, th in ipairs(thrusters) do
+    local c = cal[th.name]
+    if th.role ~= "bottom" and not th.vector and n[th.ptype] and len(c.F0) > 1e-6 then
+      local k = sum[th.ptype] / n[th.ptype] / len(c.F0)
+      c.F0, c.T0 = mul(c.F0, k), mul(c.T0, k)
+      log("%s strength x%.2f to match the bottom thrusters", th.name, k)
+    end
   end
   settle(2)
   S.calScale = nil
@@ -970,7 +1020,8 @@ end
 -- Sets down upright on the target with the charges off.
 local function landUpright(target, why)
   att.want, att.ff = UP, v3()
-  S.mode, S.ctl = "ABORT", "upright"
+  -- without a calibration only the plain lift control works
+  S.mode, S.ctl = "ABORT", cal and "upright" or "lift"
   goal.pos, goal.vy = v3(target.x, target.y + 2, target.z), nil
   local t1 = now()
   while now() - t1 < 4 or S.pos.y > target.y + 3 do
@@ -1004,9 +1055,21 @@ local function missionLoop()
     waitUntil(function() return S.pos.y > calY - 1.5 and math.abs(S.vel.y) < 1.5 end,
       function() return string.format("Climbing to %.0f", calY) end)
   else
-    goal.pos, goal.vy = v3(S.pad.x, S.pad.y + 3, S.pad.z), nil
+    -- Hover steadily a few blocks up first, so the tests aren't thrown off
+    -- by it still rising or sinking (or touching the ground). Starts early
+    -- if it begins to lean.
+    goal.pos, goal.vy = v3(S.pad.x, S.pad.y + 5, S.pad.z), nil
     S.ctl = "lift"
-    waitUntil(function() return S.pos.y > S.pad.y + 1.5 end, function() return "Lifting off" end)
+    local steadySince = nil
+    waitUntil(function()
+      if tiltDeg() > 8 and S.pos.y > S.pad.y + 2 then return true end
+      if S.pos.y > S.pad.y + 4 and math.abs(S.vel.y) < 0.4 then
+        steadySince = steadySince or now()
+        return now() - steadySince > 1
+      end
+      steadySince = nil
+      return false
+    end, function() return "Lifting off" end)
   end
 
   -- 2. learn the thrusters (first flight only)
@@ -1195,8 +1258,8 @@ local function logLoop()
         parts[#parts + 1] = string.format("%s%d/%.2f/%.2f", th.role:sub(1, 1):upper(),
           th.sentT or 0, th.sentX or 0, th.sentY or 0)
       end
-      log("%-9s y=%.1f pos %s vel %s tilt %.0f gnd %s | %s", S.mode, S.pos.y, fmtV(S.pos), fmtV(S.vel),
-        tiltDeg(), S.ground and string.format("%.1f", S.ground) or "-", table.concat(parts, " "))
+      log("%-9s y=%.1f pos %s vel %s tilt %.0f gnd %s hov %.2f | %s", S.mode, S.pos.y, fmtV(S.pos), fmtV(S.vel),
+        tiltDeg(), S.ground and string.format("%.1f", S.ground) or "-", S.hover, table.concat(parts, " "))
     end
   end
 end
@@ -1252,7 +1315,27 @@ local function setup()
     pcall(peripheral.call, name, vector and "setThrust" or "setPower", 0)
     print(answer:upper())
     if answer == "b" then table.insert(cfg.bottom, name)
-    elseif answer == "s" then table.insert(cfg.side, name)
+    elseif answer == "s" then
+      table.insert(cfg.side, name)
+      -- Which way it pushes, so it can help level the craft from lift-off,
+      -- before calibration. Minecraft: north -Z, south +Z, east +X, west -X.
+      write("  Flame points which way? [N/E/S/W] ")
+      local flame = nil
+      while not flame do
+        local _, ch = os.pullEvent("char")
+        ch = ch:lower()
+        local dirs = { n = v3(0, 0, -1), s = v3(0, 0, 1), e = v3(1, 0, 0), w = v3(-1, 0, 0) }
+        if dirs[ch] then flame = dirs[ch]; print(ch:upper()) end
+      end
+      local push = mul(flame, -1)
+      local ok, pose = pcall(function() return sublevel.getLogicalPose() end)
+      if ok and pose then
+        local o = pose.orientation
+        local q = o.v and { x = o.v.x, y = o.v.y, z = o.v.z, w = o.a } or { x = o.x, y = o.y, z = o.z, w = o.w }
+        push = rotate(q, push, true)
+      end
+      cfg.push = cfg.push or {}
+      cfg.push[name] = push
     elseif answer == "t" then table.insert(cfg.top, name) end
   end
   writeFile(CFG_FILE, textutils.serialize(cfg))
@@ -1269,13 +1352,16 @@ local function loadThrusters()
     if not saved then return false end
     local cfg = textutils.unserialize(saved)
     bottom, side, top = cfg.bottom, cfg.side, cfg.top or {}
+    S.pushDirs = cfg.push or {}
   end
   thrusters = {}
   for _, list in ipairs({ { bottom, "bottom" }, { side, "side" }, { top, "top" } }) do
     for _, name in ipairs(list[1]) do
       if not peripheral.isPresent(name) then error("Thruster " .. name .. " is missing. Run: flip setup", 0) end
-      local vector = VECTOR_TYPES[peripheral.getType(name)] and true or false
-      thrusters[#thrusters + 1] = { name = name, role = list[2], vector = vector, t = 0, ax = 0, ay = 0 }
+      local ptype = peripheral.getType(name)
+      local vector = VECTOR_TYPES[ptype] and true or false
+      thrusters[#thrusters + 1] = { name = name, role = list[2], vector = vector, ptype = ptype, t = 0, ax = 0, ay = 0,
+        pushDir = S.pushDirs and S.pushDirs[name] }
     end
   end
   return true
