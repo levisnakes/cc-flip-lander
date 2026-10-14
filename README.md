@@ -26,8 +26,8 @@ flip <x> <y> <z>
 
 Or just `flip` and type the target. Y is the ground height at the target. Hold **Ctrl+T** to abort; every output turns off.
 
-1. **Climb** 20 blocks off the pad.
-2. **Calibrate** (first flight only, about 1–2 minutes): it pulses every thruster to learn how each one pushes and turns the craft. The result is saved to `flip.cal`. Run `flip recal` after rebuilding the craft.
+1. **Calibrate** (first flight only, about 1–2 minutes): right after lift-off it pulses every thruster to learn how each one pushes and turns the craft. Nothing levels it until then, so **the bottom thrusters must sit evenly around the center of mass**, or it tips on take-off. The result is saved to `flip.cal`. Run `flip recal` after rebuilding the craft.
+2. **Climb** 20 blocks.
 3. **Cruise** to the target.
 4. **Approach**: sinks to `FLIP_HEIGHT` (160) above the target and holds still.
 5. **Pop-up and flip**: climbs fast, then rolls over. A 12-block craft takes about 7 seconds and drops around 60 blocks doing it, which is why `FLIP_HEIGHT` is high.
@@ -44,6 +44,7 @@ A tall craft steers like a rocket: it leans so the main engines push it where it
 
 ## Safety
 
+- Upright and past `MAX_TILT` (35°), every thruster cuts out and the flight stops, so a tipped craft can't fly off sideways.
 - It only fires upside down and within `DEPLOY_RADIUS` (6 blocks) of the target. Otherwise it lands without firing.
 - `ARMED = false` lands upside down without firing (or upright, if there are no nose engines).
 - If it can't turn over, it gives up and lands upright, charges off.

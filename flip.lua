@@ -25,7 +25,7 @@
 --   INVERTED   nose engines brake the descent  (DROP without them: it falls)
 --   DEPLOY     sensor reads DEPLOY_DISTANCE: all 4 charge outputs fire at once
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 -- ======================== SETTINGS ===========================
 -- To keep your own values across updates, put them in /config.lua
@@ -80,7 +80,10 @@ CHARGE_SECONDS = 1      -- how long the pulse stays on
 CHARGE_THRUSTERS = "cut"
 
 -- Calibration (first flight; delete flip.cal or run  flip recal  to redo)
-CAL_HEIGHT = 20         -- climb this far off the pad first
+CAL_HEIGHT = 20         -- climb this far after calibrating, before cruising
+-- Upright and past this tilt (degrees) every thruster cuts out and the
+-- flight stops, so a tipped craft can't fly off sideways.
+MAX_TILT = 35
 HOVER_GUESS = 0.6       -- starting bottom throttle (0..1); it learns the real one
 CAL_SIDE_THROTTLE = 0.5 -- vector side thruster throttle while its nozzle is tested
 CAL_STEP = 0.2          -- throttle change per test pulse
@@ -544,6 +547,15 @@ end
 local function controlLoop()
   while true do
     waitFix()
+    local upright = S.ctl == "lift" or S.ctl == "upright" or (S.ctl == "manual" and S.mode == "CALIBRATE")
+    -- (vector lift thrusters level themselves back from big leans, so they're exempt)
+    if upright and not S.vectorLift and tiltDeg() > MAX_TILT then
+      allOff()
+      S.ctl = "off"
+      log("TIPPED %.0f deg in %s: all off", tiltDeg(), S.mode)
+      error(string.format("Tipped over (%.0f deg) during %s - all thrusters off. "
+        .. "Check the bottom thrusters sit evenly around the center of mass.", tiltDeg(), S.mode), 0)
+    end
     if S.ctl == "lift" then
       liftOnly()
     elseif LIMITS[S.ctl] and cal and onSable then
@@ -832,11 +844,13 @@ local function calibrate()
   end
   -- 1. bottom throttles, while the others hold the hover power. After
   -- this the bottom thrusters can level the craft between the other tests.
+  -- Nothing levels the craft yet, so these run back to back right after
+  -- lift-off; each one measured joins in leveling straight away.
   local hover = S.hover
   for i, th in ipairs(thrusters) do
     if th.role == "bottom" then
       S.status = "Testing bottom thruster " .. i
-      settle(1.5)
+      if S.vectorLift then settle(1.5) else S.ctl = "lift"; waitSeconds(0.3) end
       hover = S.hover
       cal[th.name] = testThruster(th, hover, "throttle")
     end
@@ -978,13 +992,22 @@ local function missionLoop()
   S.velI = v3()
   if cal then chooseSteering() end
 
-  -- 1. climb off the pad
+  -- 1. take off. Not calibrated yet: nothing can level it, so it calibrates
+  -- the moment it lifts off, then climbs.
   S.mode = "CLIMB"
   local calY = math.min(S.pos.y + CAL_HEIGHT, CRUISE_Y)
-  goal.pos, goal.vy = v3(S.pad.x, calY, S.pad.z), nil
-  S.ctl = cal and "upright" or "lift"
-  waitUntil(function() return S.pos.y > calY - 1.5 and math.abs(S.vel.y) < 1.5 end,
-    function() return string.format("Climbing to %.0f", calY) end)
+  -- (vector bottom thrusters level well enough to climb first)
+  for _, th in ipairs(thrusters) do if th.role == "bottom" and th.vector then S.vectorLift = true end end
+  if cal or S.vectorLift then
+    goal.pos, goal.vy = v3(S.pad.x, calY, S.pad.z), nil
+    S.ctl = cal and "upright" or "lift"
+    waitUntil(function() return S.pos.y > calY - 1.5 and math.abs(S.vel.y) < 1.5 end,
+      function() return string.format("Climbing to %.0f", calY) end)
+  else
+    goal.pos, goal.vy = v3(S.pad.x, S.pad.y + 3, S.pad.z), nil
+    S.ctl = "lift"
+    waitUntil(function() return S.pos.y > S.pad.y + 1.5 end, function() return "Lifting off" end)
+  end
 
   -- 2. learn the thrusters (first flight only)
   if not cal and calibrate() == false or S.hover > 0.8 then
