@@ -1,11 +1,14 @@
 # Flip Lander
 
-ComputerCraft autopilot for a Create Aeronautics craft with 8 vector thrusters (Create Propulsion). It flies to a target, flips upside down above it, descends inverted, and fires 4 redstone outputs together when the Optical Sensor reads the trigger distance.
+ComputerCraft autopilot for a Create Aeronautics craft. It flies to a target, flips upside down above it, descends inverted, and fires 4 redstone outputs together when the Optical Sensor reads the trigger distance. Works with regular Create Propulsion thrusters (`setPower`) and vector thrusters, mixed freely.
 
-- **4 bottom vector thrusters**: lift, altitude, descent while upright.
-- **4 side vector thrusters**: steering, leveling, the flip, and braking the fall while upside down (their nozzles tilt to push up).
-- **Optical Sensor**: on the craft's **top** face, pointing up. Once the craft is upside down it looks at the ground.
-- **CC: Sable** is needed for the craft's rotation. Without it the program won't fly.
+Thruster roles (you pick them in `flip setup`):
+
+- **Bottom (B)**: lift and altitude while upright. 4 at the corners works well.
+- **Side (S)**: steering and leveling. On a tall craft, mount them **near the top** so they can turn the craft over.
+- **Top / nose (T)**: point the other way (exhaust out the top while upright). Once the craft is upside down they hold it up and brake the descent. Without them it flips and just falls, which lands far off target on a tall craft, so the charges won't fire.
+- **Optical Sensor**: on the **nose**, pointing straight out the top, so it faces the ground once the craft is flipped.
+- **CC: Sable** is needed for the craft's position and rotation.
 
 ## Install
 
@@ -13,7 +16,7 @@ ComputerCraft autopilot for a Create Aeronautics craft with 8 vector thrusters (
 wget https://raw.githubusercontent.com/levisnakes/cc-flip-lander/main/flip.lua flip.lua
 ```
 
-Then `flip setup`: each thruster's nozzle wiggles in turn and you press **B** (bottom), **S** (side) or **I** (ignore).
+Then run `flip setup`. Each thruster puffs at low power (or a vector nozzle wiggles) in turn, and you press **B**, **S**, **T** or **I** (ignore).
 
 ## Fly
 
@@ -24,31 +27,33 @@ flip <x> <y> <z>
 Or just `flip` and type the target. Y is the ground height at the target. Hold **Ctrl+T** to abort; every output turns off.
 
 1. **Climb** 20 blocks off the pad.
-2. **Calibrate** (first flight only, about 2 minutes): it pulses every thruster and nozzle to learn how each one pushes and turns the craft. The result is saved to `flip.cal`, so later flights skip this. Run `flip recal` after you rebuild the craft.
-3. **Cruise** at `CRUISE_Y` to the target.
-4. **Approach**: sinks to `FLIP_HEIGHT` (40) above the target and stops.
-5. **Flip**: bottom thrusters fade out, side nozzles roll the craft over in about `FLIP_SECONDS`.
-6. **Inverted descent** at `DESCENT_SPEED`, slowing to `FINAL_SPEED` near the ground.
-7. **Deploy**: when the sensor reads `DEPLOY_DISTANCE` (2.5), all 4 `CHARGES` switch on in the same tick for `CHARGE_SECONDS`.
+2. **Calibrate** (first flight only, about 1–2 minutes): it pulses every thruster to learn how each one pushes and turns the craft. The result is saved to `flip.cal`. Run `flip recal` after rebuilding the craft.
+3. **Cruise** to the target.
+4. **Approach**: sinks to `FLIP_HEIGHT` (160) above the target and holds still.
+5. **Pop-up and flip**: climbs fast, then rolls over. A 12-block craft takes about 7 seconds and drops around 60 blocks doing it, which is why `FLIP_HEIGHT` is high.
+6. **Inverted descent**: the nose engines brake and steer it back over the target, slowing to `FINAL_SPEED` near the ground.
+7. **Deploy**: when the sensor reads `DEPLOY_DISTANCE` (2.5), all 4 `CHARGES` switch on in the same tick.
+
+A tall craft steers like a rocket: it leans so the main engines push it where it should go, and the side thrusters just hold the lean. It picks this mode automatically from the calibration.
+
+## Weight and thrust
+
+- **Bottom engines together need about 1.3× the craft's weight.** With 4 × 480 pN = 1,920 pN, keep the craft at or under ~1,500 pN *with fuel and nose engines on board*. If it's heavier, it refuses to fly after calibration ("Too heavy") and lands.
+- **Nose engines together need at least 1.15× the weight**, or it lands upright instead of flipping. 4 × 480 pN is enough for ~1,500 pN.
+- Check the craft's total weight again after adding the nose engines and fuel tanks.
 
 ## Safety
 
-- It only fires upside down (over 120° tilt), and only within `DEPLOY_RADIUS` (6 blocks) of the target. Outside that it lands without firing.
-- `ARMED = false` lands upside down without firing.
-- If the side thrusters can't turn it over, it gives up after 4× `FLIP_SECONDS`, lands upright and doesn't fire.
-
-## Build notes
-
-- Upside down, only the side nozzles hold the craft up, and a nozzle tilts at most 30°, so only half of each side thruster's thrust points up. **Together the 4 side thrusters need about 2× the craft's weight.** If not, the flip fails safely.
-- Put the bottom thrusters around the center of mass, one per corner works best.
-- Thrusters must be on the computer's network (touching it or on wired modems).
+- It only fires upside down and within `DEPLOY_RADIUS` (6 blocks) of the target. Otherwise it lands without firing.
+- `ARMED = false` lands upside down without firing (or upright, if there are no nose engines).
+- If it can't turn over, it gives up and lands upright, charges off.
 
 ## Settings
 
 Settings are at the top of `flip.lua`. To keep your own values across updates, put them in `/config.lua`, for example:
 
 ```
-CRUISE_Y = 150
+CRUISE_Y = 250
 DEPLOY_DISTANCE = 3
 CHARGES = {
   { relay = "redstone_relay_0", side = "front" },
@@ -58,14 +63,12 @@ CHARGES = {
 }
 ```
 
-`CHARGE_THRUSTERS` sets the thrusters at the moment of firing: `"cut"` (all off, default), `"hold"` (keep braking) or `"full"` (all full power, nozzles centered).
+`CHARGE_THRUSTERS` sets the thrusters at the moment of firing: `"cut"` (all off, default), `"hold"` (keep braking) or `"full"`.
 
-If it wobbles, raise `ATT_D`. If it's slow to follow the flip, raise `ATT_P`.
+If it wobbles, raise `ATT_D`. If it leans too much while steering, lower `MAX_LEAN`.
 
-## Updates
+## Updates and logs
 
 It checks GitHub on start and every 15 minutes (never mid-flight), keeps your settings, and restarts. Turn off with `AUTO_UPDATE = false`.
 
-## Flight log
-
-Every flight writes `flip.log`: calibration results, then position, tilt, sensor and every thruster's output 5 times a second. Share it with `pastebin put flip.log`.
+Every flight writes `flip.log` (calibration results, then position, tilt, sensor and every thruster 5 times a second). Share it with `pastebin put flip.log`.

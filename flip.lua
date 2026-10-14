@@ -1,9 +1,14 @@
--- Flip Lander: flies an 8-vector-thruster Create Aeronautics craft to a
--- target, flips it upside down on the way in, lands it inverted and fires
--- 4 side outputs when the Optical Sensor reads the trigger distance.
+-- Flip Lander: flies a Create Aeronautics craft to a target, flips it
+-- upside down on the way in and fires 4 outputs when the Optical Sensor
+-- reads the trigger distance. Works with regular thrusters (setPower) and
+-- vector thrusters (setThrust + nozzle aim), mixed freely.
 --
---   4 bottom vector thrusters  lift, altitude, descent
---   4 side vector thrusters    steering, leveling, the flip, inverted braking
+--   bottom thrusters   lift and altitude while upright
+--   side thrusters     steering and leveling; mounted away from the center
+--                      of mass (e.g. near the top) they also do the flip
+--   top (nose) engines optional; point the other way, so once the craft is
+--                      upside down they hold it up and brake the descent.
+--                      Without them it flips and drops onto the target.
 --
 -- Usage:  flip <x> <y> <z>    fly to a target (or just  flip  and type it)
 --         flip setup          say which thruster is which
@@ -12,15 +17,15 @@
 --
 -- Flight plan:
 --   CLIMB      bottom thrusters lift it CAL_HEIGHT off the pad
---   CALIBRATE  (first flight only) pulses every thruster and nozzle to learn
---              how each one pushes and turns the craft; saved to flip.cal
+--   CALIBRATE  (first flight only) pulses every thruster to learn how each
+--              one pushes and turns the craft; saved to flip.cal
 --   CLIMB      to CRUISE_Y      CRUISE  to the target X/Z
 --   APPROACH   down to FLIP_HEIGHT above the target, stops and hovers
---   FLIP       bottom thrusters off, side nozzles roll it over (180 deg)
---   INVERTED   side nozzles brake the fall, slowing near the ground
+--   FLIP       climbs fast (FLIP_POPUP), then rolls it over (180 deg)
+--   INVERTED   nose engines brake the descent  (DROP without them: it falls)
 --   DEPLOY     sensor reads DEPLOY_DISTANCE: all 4 charge outputs fire at once
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 
 -- ======================== SETTINGS ===========================
 -- To keep your own values across updates, put them in /config.lua
@@ -29,19 +34,24 @@ VERSION = "1.0.0"
 -- Thruster names. Leave empty and run  flip setup  to pick them in-game.
 BOTTOM_THRUSTERS = {}
 SIDE_THRUSTERS = {}
+TOP_THRUSTERS = {}
 
 CRUISE_Y = 180          -- altitude to fly at
 CRUISE_SPEED = 12       -- top horizontal speed (blocks/s)
 CLIMB_SPEED = 6         -- top climb/sink speed while upright (blocks/s)
 ARRIVE_RADIUS = 2       -- blocks from the target X/Z counted as "over it"
 
--- The flip. It hovers FLIP_HEIGHT above the target Y, cuts the bottom
--- thrusters and rolls over in FLIP_SECONDS. It drops a little while doing it.
-FLIP_HEIGHT = 40
-FLIP_SECONDS = 2.5
+-- The flip. It hovers FLIP_HEIGHT above the target Y, fades out the bottom
+-- thrusters and rolls over. It drops a little while doing it.
+FLIP_HEIGHT = 160        -- a 12-block craft drops ~60 blocks flipping and needs room to brake
+FLIP_SECONDS = 2.5      -- shortest flip; slower if the thrusters can't turn it that fast
+-- Tall crafts (side thrusters far from the center of mass) climb at this
+-- speed (blocks/s) right before flipping, so the craft is still rising while
+-- it's on its side and nothing holds it up. 0 = off.
+FLIP_POPUP = 8
 FLIP_AXIS = "auto"      -- "auto", "x" or "z": ship axis to roll around
 
--- Inverted descent (side nozzles brake the fall)
+-- Inverted descent (nose engines brake the fall)
 DESCENT_SPEED = 5       -- blocks/s
 FINAL_SPEED = 1.5       -- blocks/s for the last SLOW_DISTANCE blocks
 SLOW_DISTANCE = 10
@@ -71,8 +81,8 @@ CHARGE_THRUSTERS = "cut"
 
 -- Calibration (first flight; delete flip.cal or run  flip recal  to redo)
 CAL_HEIGHT = 20         -- climb this far off the pad first
-HOVER_GUESS = 0.45      -- starting bottom throttle (0..1); it learns the real one
-CAL_SIDE_THROTTLE = 0.5 -- side thruster throttle while its nozzle is tested
+HOVER_GUESS = 0.6       -- starting bottom throttle (0..1); it learns the real one
+CAL_SIDE_THROTTLE = 0.5 -- vector side thruster throttle while its nozzle is tested
 CAL_STEP = 0.2          -- throttle change per test pulse
 CAL_AIM = 0.5           -- nozzle aim per test pulse (-1..1)
 CAL_PULSE = 0.6         -- seconds per pulse
@@ -82,9 +92,10 @@ POS_GAIN = 0.6          -- position error -> wanted speed
 VEL_GAIN = 1.8          -- speed error -> wanted acceleration
 VEL_I = 0.4             -- learns steady pushes (wind, off-center weight)
 MAX_ACCEL = 8           -- blocks/s^2, horizontal
+MAX_LEAN = 20           -- most it leans to steer (degrees), tall crafts
 ATT_P = 5               -- attitude stiffness; raise if it lags the flip
 ATT_D = 4               -- attitude damping; raise if it wobbles
-SIDE_MIN = 0.15         -- side thrusters never go below this in flight,
+SIDE_MIN = 0.15         -- vector side thrusters never go below this in flight,
                         -- so the nozzles always have something to steer
 
 AUTO_UPDATE = true
@@ -99,6 +110,7 @@ end
 
 local CFG_FILE, CAL_FILE, LOG_FILE = "flip.cfg", "flip.cal", "flip.log"
 local VECTOR_TYPES = { vector_thruster = true, creative_vector_thruster = true, liquid_vector_thruster = true }
+local REGULAR_TYPES = { thruster = true, creative_thruster = true, solid_fuel_thruster = true, ion_thruster = true }
 
 -- ============================================================ helpers
 
@@ -184,7 +196,7 @@ local onSable = false
 
 -- ============================================================ thruster output
 
--- Throttle only takes 16 steps and the nozzle 1/15 steps. Each tick's
+-- Power only takes 16 steps and the nozzle 1/15 steps. Each tick's
 -- rounding error carries into the next so in-between values average out.
 local function dither(th, key, v, steps, lo)
   th.err = th.err or {}
@@ -205,9 +217,10 @@ local function flush()
     local ay = dither(th, "y", clamp(th.ay, -1, 1), 15, -1)
     if th.sentT ~= thrust then
       th.sentT = thrust
-      jobs[#jobs + 1] = function() pcall(peripheral.call, th.name, "setThrust", thrust) end
+      local method = th.vector and "setThrust" or "setPower"
+      jobs[#jobs + 1] = function() pcall(peripheral.call, th.name, method, thrust) end
     end
-    if th.sentX ~= ax or th.sentY ~= ay then
+    if th.vector and (th.sentX ~= ax or th.sentY ~= ay) then
       th.sentX, th.sentY = ax, ay
       jobs[#jobs + 1] = function() pcall(peripheral.call, th.name, "setVector", ax, ay) end
     end
@@ -228,8 +241,12 @@ end
 
 local function allOff()
   for _, th in ipairs(thrusters) do
-    pcall(peripheral.call, th.name, "setThrust", 0)
-    pcall(peripheral.call, th.name, "setVector", 0, 0)
+    if th.vector then
+      pcall(peripheral.call, th.name, "setThrust", 0)
+      pcall(peripheral.call, th.name, "setVector", 0, 0)
+    else
+      pcall(peripheral.call, th.name, "setPower", 0)
+    end
     th.t, th.ax, th.ay, th.sentT, th.sentX, th.sentY = 0, 0, 0, 0, 0, 0
   end
   chargesOff()
@@ -326,15 +343,22 @@ local function contribution(th, c)
 end
 
 -- limits: role -> { lo, hi } throttle bounds; missing role = off
-local function allocate(wantF, wantT, limits)
+-- wForce: how much getting the force right matters next to the torque,
+-- per ship axis ({x=, y=, z=}); default W_FORCE on all three
+local function allocate(wantF, wantT, limits, wForce)
+  local W = wForce or v3(W_FORCE, W_FORCE, W_FORCE)
+  local function dotF(a, b) return W.x * a.x * b.x + W.y * a.y * b.y + W.z * a.z * b.z end
   local F, T = v3(), v3()
   local act = {}
   for _, th in ipairs(thrusters) do
     local lim = limits[th.role]
     local c = cal[th.name]
     if lim and c then
-      th.t = clamp(th.t, lim[1], lim[2])
-      act[#act + 1] = { th = th, c = c, lo = lim[1], hi = lim[2] }
+      local lo = lim[1]
+      if th.vector and th.role == "side" then lo = math.min(math.max(lo, SIDE_MIN), lim[2]) end
+      if not th.vector then th.ax, th.ay = 0, 0 end
+      th.t = clamp(th.t, lo, lim[2])
+      act[#act + 1] = { th = th, c = c, lo = lo, hi = lim[2] }
       local g, h = contribution(th, c)
       F, T = add(F, mul(g, th.t)), add(T, mul(h, th.t))
     else
@@ -345,19 +369,19 @@ local function allocate(wantF, wantT, limits)
     for _, a in ipairs(act) do
       local th, c = a.th, a.c
       -- nozzle axes (only matter while the thruster is running)
-      for _, k in ipairs({ { "ax", "FX", "TX" }, { "ay", "FY", "TY" } }) do
+      for _, k in ipairs(th.vector and { { "ax", "FX", "TX" }, { "ay", "FY", "TY" } } or {}) do
         local fa, ta = mul(c[k[2]], th.t), mul(c[k[3]], th.t)
         F, T = sub(F, mul(fa, th[k[1]])), sub(T, mul(ta, th[k[1]]))
-        local den = W_FORCE * dot(fa, fa) + W_TORQUE * dot(ta, ta) + AIM_COST
-        local num = W_FORCE * dot(sub(wantF, F), fa) + W_TORQUE * dot(sub(wantT, T), ta)
+        local den = dotF(fa, fa) + W_TORQUE * dot(ta, ta) + AIM_COST
+        local num = dotF(sub(wantF, F), fa) + W_TORQUE * dot(sub(wantT, T), ta)
         th[k[1]] = clamp(num / den, -1, 1)
         F, T = add(F, mul(fa, th[k[1]])), add(T, mul(ta, th[k[1]]))
       end
       -- throttle
       local g, h = contribution(th, c)
       F, T = sub(F, mul(g, th.t)), sub(T, mul(h, th.t))
-      local den = W_FORCE * dot(g, g) + W_TORQUE * dot(h, h) + 1e-6
-      local num = W_FORCE * dot(sub(wantF, F), g) + W_TORQUE * dot(sub(wantT, T), h) - POWER_COST / 2
+      local den = dotF(g, g) + W_TORQUE * dot(h, h) + 1e-6
+      local num = dotF(sub(wantF, F), g) + W_TORQUE * dot(sub(wantT, T), h) - POWER_COST / 2
       th.t = clamp(num / den, a.lo, a.hi)
       F, T = add(F, mul(g, th.t)), add(T, mul(h, th.t))
     end
@@ -394,12 +418,14 @@ local function wantAccel(wantVel)
   lastCtl = t
   local err = sub(wantVel, S.vel)
   -- Flipping or upside down the side thrusters are busy holding it up, so
-  -- sideways control is gentler and doesn't wind up.
+  -- sideways control is gentler and doesn't wind up. A craft that steers by
+  -- leaning takes a while to change its lean, so it steers gently too.
   local busy = S.ctl == "flip" or S.ctl == "inverted"
   local hI = busy and 0 or VEL_I
+  local hGain = busy and 0.6 * VEL_GAIN or VEL_GAIN
+  if S.leanSteer then hGain, hI = 0.35 * VEL_GAIN, 0.25 * hI end
   S.velI = add(S.velI, v3(err.x * hI * dt, err.y * VEL_I * dt, err.z * hI * dt))
   S.velI = v3(clamp(S.velI.x, -3, 3), clamp(S.velI.y, -6, 6), clamp(S.velI.z, -3, 3))
-  local hGain = busy and 0.6 * VEL_GAIN or VEL_GAIN
   local a = add(v3(err.x * hGain, err.y * VEL_GAIN, err.z * hGain), S.velI)
   local maxA = busy and 0.4 * MAX_ACCEL or MAX_ACCEL
   local h = math.sqrt(a.x * a.x + a.z * a.z)
@@ -409,7 +435,8 @@ end
 
 -- Speed toward a point that arrives at zero speed: sqrt braking profile.
 local function approachSpeed(dist, top, brake)
-  return math.min(top, math.sqrt(2 * brake * math.max(dist, 0)), POS_GAIN * dist + 0.5 * math.min(dist, 1))
+  local gain = S.leanSteer and 0.4 * POS_GAIN or POS_GAIN
+  return math.min(top, math.sqrt(2 * brake * math.max(dist, 0)), gain * dist + 0.5 * math.min(dist, 1))
 end
 
 local goal = { pos = nil, vy = nil }  -- hold/fly to goal.pos; goal.vy overrides vertical speed
@@ -420,7 +447,8 @@ local function wantVelocity()
     local dx, dz = goal.pos.x - S.pos.x, goal.pos.z - S.pos.z
     local d = math.sqrt(dx * dx + dz * dz)
     if d > 0.05 then
-      local sp = approachSpeed(d, goal.maxSpeed or CRUISE_SPEED, goal.brake or 0.4 * MAX_ACCEL)
+      local brake = goal.brake or (S.leanSteer and 1.2 or 0.4 * MAX_ACCEL)
+      local sp = approachSpeed(d, goal.maxSpeed or CRUISE_SPEED, brake)
       v.x, v.z = dx / d * sp, dz / d * sp
     end
     v.y = clamp(POS_GAIN * (goal.pos.y - S.pos.y), -CLIMB_SPEED, CLIMB_SPEED)
@@ -430,11 +458,12 @@ local function wantVelocity()
 end
 
 local LIMITS = {
-  upright = { bottom = { 0, 1 }, side = { SIDE_MIN, 1 } },
-  -- bottom thrusters only help while they still point mostly up (see controlLoop)
-  flip = { bottom = { 0, 1 }, side = { SIDE_MIN, 1 } },
+  upright = { bottom = { 0, 1 }, side = { 0, 1 } },
+  -- bottom thrusters help only while they point mostly up, nose engines
+  -- only once they do (see controlLoop)
+  flip = { bottom = { 0, 1 }, side = { 0, 1 }, top = { 0, 1 } },
   -- upside down the bottom thrusters would push it into the ground
-  inverted = { side = { SIDE_MIN, 1 } },
+  inverted = { side = { 0, 1 }, top = { 0, 1 } },
 }
 
 S.ctl = "off"   -- "off" | "manual" (calibration drives outputs) | "lift" | a LIMITS key
@@ -520,13 +549,46 @@ local function controlLoop()
     elseif LIMITS[S.ctl] and cal and onSable then
       local a = wantAccel(wantVelocity())
       local wantF = rotate(S.orient, add(a, v3(0, S.gravity, 0)), true)
+      local wF = nil
+      if S.leanSteer and S.ctl ~= "flip" then
+        -- Steer like a rocket: lean so the main engines push it where it
+        -- should go, and ask only for push along the craft's length.
+        -- Side thrusters far from the center of mass then just hold the lean.
+        local h = v3(a.x / S.gravity, 0, a.z / S.gravity)
+        local m = len(h)
+        local maxLean = math.tan(math.rad(MAX_LEAN))
+        if m > maxLean then h = mul(h, maxLean / m) end
+        local dir = add(UP, h)
+        dir = mul(dir, 1 / len(dir))
+        if S.ctl == "inverted" then
+          -- the nose engines push along -top: top points down, leaning away
+          att.want = mul(dir, -1)
+          if not S.hasNose then att.want = v3(0, -1, 0) end
+        else
+          att.want = dir
+        end
+        local up = bodyUp().y
+        local axial = (a.y + S.gravity) / (up >= 0 and math.max(up, 0.5) or math.min(up, -0.5))
+        -- lift matters, sideways push hardly (the lean does the steering)
+        wantF, wF = v3(0, axial, 0), v3(0.05, 1, 0.05)
+      end
       local lim = LIMITS[S.ctl]
       if S.ctl == "flip" then
-        -- fade out with the lean and over the first FLIP_SECONDS
-        local fade = math.max(0, 1 - (now() - (S.flipStart or now())) / FLIP_SECONDS)
-        lim = { side = lim.side, bottom = { 0, clamp((bodyUp().y - 0.3) / 0.5, 0, 1) * fade } }
+        -- fade out with the lean and over the flip
+        local fade = math.max(0, 1 - (now() - (S.flipStart or now())) / (S.flipTime or FLIP_SECONDS))
+        local up = bodyUp().y
+        lim = { side = lim.side, bottom = { 0, clamp((up - 0.3) / 0.5, 0, 1) * fade },
+          top = { 0, clamp((-up - 0.3) / 0.5, 0, 1) } }
       end
-      allocate(wantF, attitudeTorque(), lim)
+      -- While flipping, turning matters most: side thrusters near the top
+      -- can't turn it without also pushing it sideways. Only the push along
+      -- the craft's own length is asked for (the "stop falling" wish would
+      -- otherwise turn into a big sideways one as it tips).
+      if S.ctl == "flip" and S.leanSteer then
+        wantF = rotate(S.orient, v3(0, a.y + S.gravity, 0), true)
+        wantF, wF = v3(0, wantF.y, 0), v3(0.02, 0.1, 0.02)
+      end
+      allocate(wantF, attitudeTorque(), lim, wF)
     end
     if S.ctl ~= "off" then flush() end
   end
@@ -562,10 +624,11 @@ end
 -- delta, ship frame: linear and angular acceleration. Pushing both ways
 -- cancels most of the spin it causes.
 local CAL_SPIN, CAL_MIN_PULSE = 0.35, 0.25
-local function doublet(apply, delta)
+local function doublet(apply, delta, spinLimit)
+  spinLimit = spinLimit or CAL_SPIN
   apply(delta)
   local fPlus, dwPlus, dur = measure(function(t, spin)
-    return t >= CAL_PULSE or (spin > CAL_SPIN and t >= CAL_MIN_PULSE)
+    return t >= CAL_PULSE or (spin > spinLimit and t >= CAL_MIN_PULSE)
   end)
   apply(-delta)
   local fMinus, dwMinus, d2 = measure(function(t) return t >= dur end)
@@ -675,6 +738,14 @@ local function testThruster(th, base, part, c, partner, partnerT)
     th.t = base
     flush(); waitSeconds(0.3)
     c.F0, c.T0 = doublet(function(d) th.t = base + d; flush() end, CAL_STEP)
+  elseif part == "throttle" and not th.vector then
+    -- From off: 2 x CAL_STEP, then off, leveling paused, stopped early if it
+    -- starts to turn (side thrusters near the top turn it hard).
+    S.ctl = "manual"
+    -- It can't push the other way, so the pulse leaves the craft turning;
+    -- stop at a small turn rate the thrusters measured so far can undo.
+    c.F0, c.T0 = doublet(function(d) th.t = d > 0 and 2 * d or 0; flush() end, CAL_STEP, 0.1)
+    S.ctl = "lift"
   elseif part == "throttle" then
     S.testing, S.ctl = th, "lift"
     th.t = base
@@ -700,6 +771,13 @@ local function testThruster(th, base, part, c, partner, partnerT)
     c = cleanResponses(c)
     c.scaled = true
   end
+  if part == "throttle" and not th.vector and len(c.F0) > 1e-6 then
+    -- a regular thruster pushes straight along one ship axis and can't turn
+    -- the craft around that axis
+    local d = snap(c.F0)
+    c.F0 = mul(d, len(c.F0))
+    c.T0 = sub(c.T0, mul(d, dot(c.T0, d)))
+  end
   if S.calScale and not c.scaled then
     for _, k in ipairs({ "F0", "T0" }) do c[k] = mul(c[k], S.calScale) end
     c.scaled = true
@@ -709,12 +787,25 @@ local function testThruster(th, base, part, c, partner, partnerT)
   return c
 end
 
+-- Side thrusters far from the center of mass turn the craft more than they
+-- move it. Then it steers by leaning, like a rocket.
+local function chooseSteering()
+  local turn, push = 0, 0
+  for _, th in ipairs(thrusters) do
+    local c = cal and cal[th.name]
+    if th.role == "side" and c then turn, push = turn + len(c.T0), push + len(c.F0) end
+  end
+  S.leanSteer = push > 0 and turn / push > 0.08
+  for _, th in ipairs(thrusters) do if th.role == "top" then S.hasNose = true end end
+  log("steering: %s (side turn/push %.2f)", S.leanSteer and "lean" or "direct", push > 0 and turn / push or 0)
+end
+
 local function calibrate()
   S.mode = "CALIBRATE"
   cal = {}
   local hoverAt = v3(S.pos.x, S.pos.y, S.pos.z)
   -- leaning on the bottom thrusters only gives a few blocks/s^2
-  goal.pos, goal.vy, goal.maxSpeed, goal.brake = hoverAt, nil, 4, 1.5
+  goal.pos, goal.vy, goal.maxSpeed, goal.brake = hoverAt, nil, (S.leanSteer and 0 or 4), 1.5
   -- Thrusters take a moment to spin up, so the short tests read low. The
   -- hover throttle is known exactly, so scale every reading until the bottom
   -- thrusters at hover throttle hold up the craft's weight.
@@ -730,8 +821,12 @@ local function calibrate()
       if c then c.F0, c.T0, c.scaled = mul(c.F0, S.calScale), mul(c.T0, S.calScale), true end
     end
   end
+  -- Between tests: once the bottom thrusters are measured, every measured
+  -- thruster helps hold it steady (on a tall craft the side thrusters near
+  -- the top level it far better than the bottom ones can).
   local function settle(s)
-    S.ctl = "lift"; waitSeconds(s)
+    if S.calScale then chooseSteering() end
+    S.ctl = S.calScale and "upright" or "lift"; waitSeconds(s)
     local t0 = now()
     while (tiltDeg() > 3 or len(S.omega) > 0.05) and now() - t0 < 8 do waitFix() end
   end
@@ -747,27 +842,32 @@ local function calibrate()
     end
   end
   setScale()
-  -- 2. bottom nozzles
+  -- Too heavy: at this hover power there's nothing left to steer with.
+  if S.hover > 0.8 then
+    cal = nil
+    return false
+  end
+  -- 2. bottom nozzles (vector thrusters only)
   for i, th in ipairs(thrusters) do
-    if th.role == "bottom" then
+    if th.role == "bottom" and th.vector then
       S.status = "Testing bottom nozzle " .. i
       settle(1.5)
       cal[th.name] = testThruster(th, th.t, "aim", cal[th.name])
     end
   end
-  -- 3. side throttles, one at a time
+  -- 3. side and nose throttles, one at a time
   local sides = {}
   for i, th in ipairs(thrusters) do
-    if th.role == "side" then
-      S.status = "Testing side thruster " .. i
+    if th.role ~= "bottom" then
+      S.status = string.format("Testing %s thruster %d", th.role == "top" and "nose" or "side", i)
       settle(2)
       cal[th.name] = testThruster(th, CAL_SIDE_THROTTLE, "throttle")
       th.t = 0
-      sides[#sides + 1] = th
+      if th.role == "side" and th.vector then sides[#sides + 1] = th end
     end
   end
-  -- 4. side nozzles. The side thruster pushing the most the other way runs
-  -- too (nozzle centered), so the craft isn't shoved sideways during the test.
+  -- 4. vector side nozzles. The side thruster pushing the most the other way
+  -- runs too (nozzle centered), so the craft isn't shoved sideways.
   for i, th in ipairs(sides) do
     local c = cal[th.name]
     local partner, best = nil, 0
@@ -799,15 +899,15 @@ local function calibrate()
   S.status = "Calibration saved to " .. CAL_FILE
 end
 
--- Ship axis (x or z) the side nozzles turn the craft around most strongly.
+-- Ship axis (x or z) the side thrusters turn the craft around most strongly.
 local function flipAxisShip()
   if FLIP_AXIS == "x" then return v3(1, 0, 0) elseif FLIP_AXIS == "z" then return v3(0, 0, 1) end
   local sx, sz = 0, 0
   for _, th in ipairs(thrusters) do
     local c = cal[th.name]
     if th.role == "side" and c then
-      sx = sx + math.abs(c.TX.x) + math.abs(c.TY.x)
-      sz = sz + math.abs(c.TX.z) + math.abs(c.TY.z)
+      sx = sx + math.abs(c.T0.x) + math.abs(c.TX.x) + math.abs(c.TY.x)
+      sz = sz + math.abs(c.T0.z) + math.abs(c.TX.z) + math.abs(c.TY.z)
     end
   end
   if sx >= sz then return v3(1, 0, 0) end
@@ -853,11 +953,30 @@ local function fireCharges()
   allOff()
 end
 
+-- Sets down upright on the target with the charges off.
+local function landUpright(target, why)
+  att.want, att.ff = UP, v3()
+  S.mode, S.ctl = "ABORT", "upright"
+  goal.pos, goal.vy = v3(target.x, target.y + 2, target.z), nil
+  local t1 = now()
+  while now() - t1 < 4 or S.pos.y > target.y + 3 do
+    S.status = why
+    goal.vy = -math.min(CLIMB_SPEED, math.max(1, 0.3 * (S.pos.y - target.y)))
+    if S.ground and S.ground < 1.5 then break end
+    waitFix()
+  end
+  S.ctl = "off"
+  allOff()
+  S.mode = "LANDED"
+  S.status = why
+end
+
 local function missionLoop()
   waitFix()
   local target = S.target
   S.pad = v3(S.pos.x, S.pos.y, S.pos.z)
   S.velI = v3()
+  if cal then chooseSteering() end
 
   -- 1. climb off the pad
   S.mode = "CLIMB"
@@ -868,10 +987,12 @@ local function missionLoop()
     function() return string.format("Climbing to %.0f", calY) end)
 
   -- 2. learn the thrusters (first flight only)
-  if not cal then
-    calibrate()
-    S.velI = v3()
+  if not cal and calibrate() == false or S.hover > 0.8 then
+    landUpright(v3(S.pad.x, S.pad.y - 1, S.pad.z), string.format(
+      "Too heavy: hovers at %.0f%% power. Add bottom thrusters or lighten it.", S.hover * 100))
+    return
   end
+  S.velI = v3()
 
   -- 3. cruise altitude, then the target
   S.mode = "CLIMB"
@@ -893,11 +1014,56 @@ local function missionLoop()
     return math.abs(S.pos.y - flipY) < 1.5 and len(S.vel) < 1 and horizontalDistance(target) < ARRIVE_RADIUS
   end, function() return string.format("Descending to flip height %.0f", flipY) end)
 
-  -- 5. flip: rotate the craft's top from up to down around a horizontal axis
+  -- Without nose engines nothing holds it up once it's flipped, so it would
+  -- crash. Disarmed, it just lands upright instead.
+  local nose = 0
+  for _, th in ipairs(thrusters) do if th.role == "top" then nose = nose + 1 end end
+  if nose == 0 and not ARMED then
+    landUpright(target, "Disarmed and no nose engines - landed upright")
+    return
+  end
+  -- Upside down only the nose engines hold it up; they need some spare.
+  if nose > 0 then
+    local lift = 0
+    for _, th in ipairs(thrusters) do
+      if th.role == "top" then lift = lift + len(cal[th.name].F0) end
+    end
+    if lift < 1.15 * S.gravity then
+      landUpright(target, string.format(
+        "Nose engines too weak to hold it upside down (%.0f%% of weight) - landed upright", lift / S.gravity * 100))
+      return
+    end
+  end
+
+  -- 5. flip: rotate the craft's top from up to down around a horizontal axis.
+  -- As fast as the side thrusters can turn it: the smooth 0..180 deg path
+  -- needs a peak turn rate change of 6*pi/T^2.
+  local axisShip = flipAxisShip()
+  local turn = 0
+  for _, th in ipairs(thrusters) do
+    local c = cal[th.name]
+    if th.role == "side" and c then
+      turn = turn + math.max(math.abs(dot(c.T0, axisShip)), math.abs(dot(c.TX, axisShip)) + math.abs(dot(c.TY, axisShip)))
+    end
+  end
+  -- opposite side thrusters turn it opposite ways: only half help at once
+  turn = turn / 2
+  local flipTime = FLIP_SECONDS
+  if turn > 1e-3 then flipTime = math.max(FLIP_SECONDS, math.sqrt(6 * math.pi / (0.6 * turn))) end
+  S.flipTime = flipTime
+  log("flip time %.1fs (side thrusters turn it at %.2f rad/s^2)", flipTime, turn)
+
+  if FLIP_POPUP > 0 and S.leanSteer then
+    S.mode = "POP-UP"
+    goal.vy = FLIP_POPUP
+    waitUntil(function() return S.vel.y >= 0.8 * FLIP_POPUP end,
+      function() return string.format("Pop-up %.1f blocks/s", S.vel.y) end)
+  end
+
   S.mode = "FLIP"
   S.ctl = "flip"
-  goal.vy = nil
-  local axis = rotate(S.orient, flipAxisShip())
+  goal.pos, goal.vy = v3(target.x, S.pos.y, target.z), 0
+  local axis = rotate(S.orient, axisShip)
   axis.y = 0
   axis = mul(axis, 1 / math.max(len(axis), 1e-6))
   local side = cross(axis, UP)
@@ -905,14 +1071,14 @@ local function missionLoop()
   S.flipStart = t0
   log("FLIP start at y=%.1f axis %s", S.pos.y, fmtV(axis))
   repeat
-    local s = clamp((now() - t0) / FLIP_SECONDS, 0, 1)
+    local s = clamp((now() - t0) / flipTime, 0, 1)
     local th = math.pi * (3 * s * s - 2 * s * s * s)        -- smooth 0 -> pi
-    local acc = s < 1 and math.pi * (6 - 12 * s) / (FLIP_SECONDS * FLIP_SECONDS) or 0
+    local acc = s < 1 and math.pi * (6 - 12 * s) / (flipTime * flipTime) or 0
     att.want = add(mul(UP, math.cos(th)), mul(side, math.sin(th)))
     att.ff = mul(axis, acc)
     S.status = string.format("Flipping  %.0f deg", tiltDeg())
     waitFix()
-    if now() - t0 > 4 * FLIP_SECONDS and tiltDeg() < 120 then
+    if now() - t0 > 3 * flipTime and tiltDeg() < 120 then
       -- the side thrusters can't turn it over: give up and land upright
       log("FLIP failed: tilt %.0f after %.1fs", tiltDeg(), now() - t0)
       S.flipFailed = true
@@ -920,26 +1086,15 @@ local function missionLoop()
     end
   until s >= 1 and tiltDeg() > 150
   if S.flipFailed then
-    att.want, att.ff = UP, v3()
-    S.mode, S.ctl = "ABORT", "upright"
-    goal.pos, goal.vy = v3(target.x, target.y + 2, target.z), nil
-    local t1 = now()
-    while now() - t1 < 4 or S.pos.y > target.y + 3 do
-      S.status = "Couldn't flip (side thrusters too weak?) - landing upright, charges safe"
-      goal.vy = -math.min(CLIMB_SPEED, math.max(1, 0.3 * (S.pos.y - target.y)))
-      if S.ground and S.ground < 1.5 then break end
-      waitFix()
-    end
-    S.ctl = "off"
-    allOff()
-    S.mode = "LANDED"
+    landUpright(target, "Couldn't flip (side thrusters too weak?) - landing upright, charges safe")
     return
   end
   att.want, att.ff = v3(0, -1, 0), v3()
   log("FLIP done at y=%.1f after %.1fs", S.pos.y, now() - t0)
 
-  -- 6. upside-down descent; the sensor now looks at the ground
-  S.mode = "INVERTED"
+  -- 6. upside-down descent; the sensor now looks at the ground. Without nose
+  -- engines it just falls, the side thrusters keeping it pointed down.
+  S.mode = nose > 0 and "INVERTED" or "DROP"
   S.ctl = "inverted"
   S.velI = v3(0, S.velI.y, 0)
   while true do
@@ -949,11 +1104,14 @@ local function missionLoop()
     local speed = clamp(math.sqrt(2 * 1.5 * math.max(over - SLOW_DISTANCE, 0)) + FINAL_SPEED, FINAL_SPEED, DESCENT_SPEED)
     goal.pos = v3(target.x, S.pos.y, target.z)
     goal.vy = -speed
-    S.status = string.format("Inverted descent  ground %s", S.ground and string.format("%.1f", S.ground) or "--")
+    S.status = string.format("%s  ground %s", nose > 0 and "Inverted descent" or "Dropping",
+      S.ground and string.format("%.1f", S.ground) or "--")
+    -- falling fast it covers a block or more per tick, so look a tick ahead
+    local lead = math.max(-S.vel.y, 0) * 0.05
     -- trigger: armed, upside down, and the sensor (or, with none, the target Y) says we're there
     local reached
-    if #sensors > 0 then reached = S.ground ~= nil and S.ground <= DEPLOY_DISTANCE
-    else reached = S.pos.y - target.y <= DEPLOY_DISTANCE end
+    if #sensors > 0 then reached = S.ground ~= nil and S.ground - lead <= DEPLOY_DISTANCE
+    else reached = S.pos.y - target.y - lead <= DEPLOY_DISTANCE end
     if reached and tiltDeg() > 120 then
       local onTarget = horizontalDistance(target) <= DEPLOY_RADIUS
       if not onTarget then log("landed %.1f blocks off target: not firing", horizontalDistance(target)) end
@@ -991,12 +1149,12 @@ local function screenLoop()
     print(string.format("Ground: %s   (fires at %.1f%s)", S.ground and string.format("%.1f", S.ground) or "--",
       DEPLOY_DISTANCE, ARMED and "" or ", DISARMED"))
     print(string.format("Tilt:   %.0f deg", tiltDeg()))
-    local b, s = {}, {}
+    local out = { bottom = {}, side = {}, top = {} }
     for _, th in ipairs(thrusters) do
-      local e = string.format("%2d", th.sentT or 0)
-      if th.role == "bottom" then b[#b + 1] = e else s[#s + 1] = e end
+      table.insert(out[th.role], string.format("%2d", th.sentT or 0))
     end
-    print("Bottom: " .. table.concat(b, " ") .. "   Side: " .. table.concat(s, " "))
+    print("Bottom: " .. table.concat(out.bottom, " ") .. "  Side: " .. table.concat(out.side, " ")
+      .. (#out.top > 0 and ("  Nose: " .. table.concat(out.top, " ")) or ""))
     print("")
     print(S.status)
     print("")
@@ -1011,7 +1169,7 @@ local function logLoop()
     if S.pos then
       local parts = {}
       for _, th in ipairs(thrusters) do
-        parts[#parts + 1] = string.format("%s%d/%.2f/%.2f", th.role == "bottom" and "B" or "S",
+        parts[#parts + 1] = string.format("%s%d/%.2f/%.2f", th.role:sub(1, 1):upper(),
           th.sentT or 0, th.sentX or 0, th.sentY or 0)
       end
       log("%-9s y=%.1f pos %s vel %s tilt %.0f gnd %s | %s", S.mode, S.pos.y, fmtV(S.pos), fmtV(S.vel),
@@ -1022,66 +1180,79 @@ end
 
 -- ============================================================ setup
 
-local function vectorThrusters()
+local function allThrusters()
   local out = {}
   for _, name in ipairs(peripheralNames()) do
-    if VECTOR_TYPES[peripheral.getType(name)] then out[#out + 1] = name end
+    local t = peripheral.getType(name)
+    if VECTOR_TYPES[t] or REGULAR_TYPES[t] then out[#out + 1] = name end
   end
   table.sort(out)
   return out
 end
 
--- Wiggles each nozzle (no thrust) and asks what it is.
+-- Shows each thruster in turn (a vector nozzle wiggles, a regular thruster
+-- puffs at low power) and asks what it is.
 local function setup()
-  local names = vectorThrusters()
-  if #names == 0 then error("No vector thrusters found. Connect them with wired modems.", 0) end
-  local cfg = { bottom = {}, side = {} }
-  print(string.format("Found %d vector thrusters.", #names))
-  print("Each one's nozzle will wiggle. Say what it is:")
-  print("  B = bottom (lift)   S = side   I = ignore")
+  local names = allThrusters()
+  if #names == 0 then error("No thrusters found. Connect them with wired modems.", 0) end
+  local cfg = { bottom = {}, side = {}, top = {} }
+  print(string.format("Found %d thrusters. Each one will puff or wiggle.", #names))
+  print("  B = bottom (lift)   S = side   T = top/nose (points the")
+  print("  other way, holds it up when flipped)   I = ignore")
   for _, name in ipairs(names) do
-    pcall(peripheral.call, name, "setThrust", 0)
+    local vector = VECTOR_TYPES[peripheral.getType(name)]
     print("")
-    write(name .. " is wiggling... [B/S/I] ")
+    write(name .. "... [B/S/T/I] ")
     local answer = nil
     parallel.waitForAny(function()
       while true do
-        for _, a in ipairs({ { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } }) do
-          pcall(peripheral.call, name, "setVector", a[1], a[2])
+        if vector then
+          for _, a in ipairs({ { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } }) do
+            pcall(peripheral.call, name, "setVector", a[1], a[2])
+            sleep(0.4)
+          end
+        else
+          pcall(peripheral.call, name, "setPower", 3)
           sleep(0.4)
+          pcall(peripheral.call, name, "setPower", 0)
+          sleep(0.8)
         end
       end
     end, function()
       while not answer do
         local _, ch = os.pullEvent("char")
         ch = ch:lower()
-        if ch == "b" or ch == "s" or ch == "i" then answer = ch end
+        if ch == "b" or ch == "s" or ch == "t" or ch == "i" then answer = ch end
       end
     end)
-    pcall(peripheral.call, name, "setVector", 0, 0)
+    if vector then pcall(peripheral.call, name, "setVector", 0, 0) end
+    pcall(peripheral.call, name, vector and "setThrust" or "setPower", 0)
     print(answer:upper())
-    if answer == "b" then cfg.bottom[#cfg.bottom + 1] = name
-    elseif answer == "s" then cfg.side[#cfg.side + 1] = name end
+    if answer == "b" then table.insert(cfg.bottom, name)
+    elseif answer == "s" then table.insert(cfg.side, name)
+    elseif answer == "t" then table.insert(cfg.top, name) end
   end
   writeFile(CFG_FILE, textutils.serialize(cfg))
   if fs.exists(CAL_FILE) then fs.delete(CAL_FILE) end
   print("")
-  print(string.format("Saved: %d bottom, %d side. Calibration runs on the next flight.", #cfg.bottom, #cfg.side))
+  print(string.format("Saved: %d bottom, %d side, %d nose. Calibration runs on the next flight.",
+    #cfg.bottom, #cfg.side, #cfg.top))
 end
 
 local function loadThrusters()
-  local bottom, side = BOTTOM_THRUSTERS, SIDE_THRUSTERS
+  local bottom, side, top = BOTTOM_THRUSTERS, SIDE_THRUSTERS, TOP_THRUSTERS
   if #bottom == 0 and #side == 0 then
     local saved = readFile(CFG_FILE)
     if not saved then return false end
     local cfg = textutils.unserialize(saved)
-    bottom, side = cfg.bottom, cfg.side
+    bottom, side, top = cfg.bottom, cfg.side, cfg.top or {}
   end
   thrusters = {}
-  for _, list in ipairs({ { bottom, "bottom" }, { side, "side" } }) do
+  for _, list in ipairs({ { bottom, "bottom" }, { side, "side" }, { top, "top" } }) do
     for _, name in ipairs(list[1]) do
       if not peripheral.isPresent(name) then error("Thruster " .. name .. " is missing. Run: flip setup", 0) end
-      thrusters[#thrusters + 1] = { name = name, role = list[2], t = 0, ax = 0, ay = 0 }
+      local vector = VECTOR_TYPES[peripheral.getType(name)] and true or false
+      thrusters[#thrusters + 1] = { name = name, role = list[2], vector = vector, t = 0, ax = 0, ay = 0 }
     end
   end
   return true
@@ -1273,9 +1444,9 @@ if not loadThrusters() then
   setup()
   print("")
 end
-local nb, ns = 0, 0
-for _, th in ipairs(thrusters) do if th.role == "bottom" then nb = nb + 1 else ns = ns + 1 end end
-if nb == 0 or ns == 0 then error("Need at least one bottom and one side thruster. Run: flip setup", 0) end
+local count = { bottom = 0, side = 0, top = 0 }
+for _, th in ipairs(thrusters) do count[th.role] = count[th.role] + 1 end
+if count.bottom == 0 or count.side == 0 then error("Need at least one bottom and one side thruster. Run: flip setup", 0) end
 loadCalibration()
 
 for _, name in ipairs(peripheralNames()) do
@@ -1300,7 +1471,9 @@ else
   return
 end
 
-print(string.format("Flip Lander v%s  %d bottom, %d side thrusters, %d optical sensor(s)", VERSION, nb, ns, #sensors))
+print(string.format("Flip Lander v%s  %d bottom, %d side, %d nose thrusters, %d optical sensor(s)",
+  VERSION, count.bottom, count.side, count.top, #sensors))
+if count.top == 0 then print("No nose engines: after the flip it drops onto the target.") end
 print(cal and "Calibration loaded." or "Not calibrated: it will calibrate after take-off.")
 if #sensors == 0 then print("No Optical Sensor: it fires at the target Y instead.") end
 print("")
