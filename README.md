@@ -16,7 +16,7 @@ Thruster roles (you pick them in `flip setup`):
 wget https://raw.githubusercontent.com/levisnakes/cc-flip-lander/main/flip.lua flip.lua
 ```
 
-Then run `flip setup`. Each thruster puffs at low power (or a vector nozzle wiggles) in turn, and you press **B**, **S**, **T** or **I** (ignore). For each side thruster it also asks which way its flame points (**N/E/S/W**, see F3). That lets the side thrusters hold the craft level from lift-off, before calibration.
+Then run `flip setup`. Each thruster puffs at low power (or a vector nozzle wiggles) in turn, and you press **B**, **S**, **T** or **I** (ignore). For each side thruster it also asks which way its flame points (**N/E/S/W**, see F3). Right after lift-off it puffs the side thrusters in opposite pairs and checks those answers against what it measures (if they were typed backwards, it flips them), then the side thrusters hold the craft level for the rest of calibration.
 
 ## Fly
 

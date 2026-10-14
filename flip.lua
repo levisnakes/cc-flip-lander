@@ -25,7 +25,7 @@
 --   INVERTED   nose engines brake the descent  (DROP without them: it falls)
 --   DEPLOY     sensor reads DEPLOY_DISTANCE: all 4 charge outputs fire at once
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 
 -- ======================== SETTINGS ===========================
 -- To keep your own values across updates, put them in /config.lua
@@ -495,12 +495,13 @@ local function liftOnly()
       if cal and cal[th.name] then known[#known + 1] = th end
     elseif th ~= S.testing and th ~= S.partner then
       th.t = 0
-      -- Side thrusters help level: measured ones by their calibration,
-      -- the rest by the push direction given in setup (near the top, a push
-      -- tips the top that way). Not during tests, so readings stay clean.
+      -- Side thrusters help level (far better at it than the bottom ones on
+      -- a tall craft): measured ones by their reading, the rest by the
+      -- flame direction from setup once a reading has shown which way round
+      -- those were typed. Not during tests.
       if th.role == "side" and not S.testing and S.ctl == "lift" then
         local c = cal and cal[th.name]
-        local tq = c and c.T0 or (th.pushDir and mul(cross(UP, th.pushDir), 0.5))
+        local tq = c and c.T0 or (th.pushDir and S.dirSign and mul(cross(UP, th.pushDir), 0.5 * S.dirSign))
         if tq then helpers[#helpers + 1] = { th = th, tq = v3(tq.x, 0, tq.z) } end
       end
     end
@@ -774,11 +775,14 @@ local function testThruster(th, base, part, c, partner, partnerT)
   elseif part == "throttle" and not th.vector then
     -- From off: 2 x CAL_STEP, then off, leveling paused, stopped early if it
     -- starts to turn (side thrusters near the top turn it hard).
-    S.ctl = "manual"
+    -- The altitude control keeps running (equal on all bottom thrusters, so
+    -- it doesn't turn the craft); leveling pauses while S.testing is set.
+    S.testing, S.ctl = th, "lift"
     -- It can't push the other way, so the pulse leaves the craft turning;
     -- stop at a small turn rate the thrusters measured so far can undo.
-    c.F0, c.T0 = doublet(function(d) th.t = d > 0 and 2 * d or 0; flush() end, CAL_STEP, 0.1)
-    S.ctl = "lift"
+    c.F0, c.T0 = doublet(function(d) th.t = d > 0 and 2 * d or 0 end, CAL_STEP, 0.1)
+    th.t = 0
+    S.testing = nil
   elseif part == "throttle" then
     S.testing, S.ctl = th, "lift"
     th.t = base
@@ -806,7 +810,9 @@ local function testThruster(th, base, part, c, partner, partnerT)
   end
   if part == "throttle" and not th.vector and len(c.F0) > 1e-6 then
     -- a regular thruster pushes straight along one ship axis and can't turn
-    -- the craft around that axis
+    -- the craft around that axis; a side thruster pushes sideways (its
+    -- reading's up/down part is just the craft rising or sinking)
+    if th.role == "side" then c.F0 = v3(c.F0.x, 0, c.F0.z) end
     local d = snap(c.F0)
     c.F0 = mul(d, len(c.F0))
     c.T0 = sub(c.T0, mul(d, dot(c.T0, d)))
@@ -867,6 +873,74 @@ local function calibrate()
   -- this the bottom thrusters can level the craft between the other tests.
   -- Nothing levels the craft yet, so these run back to back right after
   -- lift-off; each one measured joins in leveling straight away.
+  -- 0. Side thrusters first, in opposite pairs (paired by the flame
+  -- directions from setup, whichever way round those were typed): each
+  -- puff's tilt is undone by its partner's, and once measured they help
+  -- hold the craft level during everything after.
+  if not S.vectorLift then
+    local todo = {}
+    for _, th in ipairs(thrusters) do if th.role == "side" and not th.vector then todo[#todo + 1] = th end end
+    while #todo > 0 do
+      local a = table.remove(todo, 1)
+      local b = nil
+      if a.pushDir then
+        for i, o in ipairs(todo) do
+          if o.pushDir and dot(o.pushDir, a.pushDir) < -0.5 then b = table.remove(todo, i) break end
+        end
+      end
+      if not b and #todo > 0 then b = table.remove(todo, 1) end
+      for _, th in ipairs({ a, b }) do
+        S.status = "Testing side thruster " .. th.name
+        local c = testThruster(th, CAL_SIDE_THROTTLE, "throttle")
+        -- The first clear reading says whether setup's flame directions
+        -- were typed the right way round (a near-the-top push tips the
+        -- top that way); after that every side thruster can help level.
+        if th.pushDir and not S.dirSign then
+          local d = dot(cross(UP, th.pushDir), c.T0)
+          if math.abs(d) > 0.5 * len(c.T0) then
+            S.dirSign = d > 0 and 1 or -1
+            log("setup flame directions are %s", S.dirSign > 0 and "right" or "reversed - using them flipped")
+          end
+        end
+        -- readings taken while tipping can be off; keep only clear ones
+        if len(c.T0) > 1e-6 and len(c.F0) > 1e-6 and math.abs(dot(c.T0, cross(UP, mul(c.F0, 1 / len(c.F0))))) > 0.5 * len(c.T0) then
+          cal[th.name] = c
+        else
+          log("unclear reading for %s, will retest", th.name)
+        end
+      end
+      S.ctl = "lift"; waitSeconds(1)
+    end
+    -- With the typed directions confirmed, trust them for which way each side
+    -- thruster pushes and turns the craft (readings taken while it tips can
+    -- point the wrong way), and take just the strength from readings that agree.
+    if S.dirSign then
+      local sumF, sumT, n = 0, 0, 0
+      for _, th in ipairs(thrusters) do
+        local c = cal[th.name]
+        if th.role == "side" and th.pushDir and c and len(c.T0) > 1e-6 then
+          local want = cross(UP, mul(th.pushDir, S.dirSign))
+          if dot(c.T0, want) > 0.7 * len(c.T0) then sumF, sumT, n = sumF + len(c.F0), sumT + len(c.T0), n + 1 end
+        end
+      end
+      local magF, magT = 2, 0.5
+      if n > 0 then magF, magT = sumF / n, sumT / n end
+      for _, th in ipairs(thrusters) do
+        if th.role == "side" and th.pushDir and not th.vector then
+          local push = mul(th.pushDir, S.dirSign)
+          cal[th.name] = { F0 = mul(push, magF), T0 = mul(cross(UP, push), magT),
+            FX = v3(), TX = v3(), FY = v3(), TY = v3() }
+        end
+      end
+      log("side thrusters from setup directions: push %.2f, turn %.2f (%d readings agreed)", magF, magT, n)
+    end
+    -- now hold a steady hover (side thrusters leveling) before the bottom tests
+    local steady, t0 = nil, now()
+    while now() - t0 < 6 do
+      waitFix()
+      if math.abs(S.vel.y) < 0.4 then steady = steady or now(); if now() - steady > 1 then break end else steady = nil end
+    end
+  end
   local hover = S.hover
   for i, th in ipairs(thrusters) do
     if th.role == "bottom" then
@@ -904,7 +978,7 @@ local function calibrate()
   -- 3. side and nose throttles, one at a time
   local sides = {}
   for i, th in ipairs(thrusters) do
-    if th.role ~= "bottom" then
+    if th.role ~= "bottom" and not cal[th.name] then
       S.status = string.format("Testing %s thruster %d", th.role == "top" and "nose" or "side", i)
       settle(2)
       cal[th.name] = testThruster(th, CAL_SIDE_THROTTLE, "throttle")
@@ -1063,6 +1137,8 @@ local function missionLoop()
     local steadySince = nil
     waitUntil(function()
       if tiltDeg() > 8 and S.pos.y > S.pad.y + 2 then return true end
+      -- regular side thrusters: start their test puffs as soon as it's up
+      if not S.vectorLift and S.pos.y > S.pad.y + 4 and math.abs(S.vel.y) < 1.5 then return true end
       if S.pos.y > S.pad.y + 4 and math.abs(S.vel.y) < 0.4 then
         steadySince = steadySince or now()
         return now() - steadySince > 1
